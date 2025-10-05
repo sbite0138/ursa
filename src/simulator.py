@@ -47,10 +47,10 @@ class Simulator:
         if self.pc >= len(self.program.instructions):
             raise StopIteration("End of program")
         instr = self.program.instructions[self.pc]
-        print(
-            f"PC: {self.pc}, Executing: {instr}, Registers: {[(-(2**32-reg) if reg >= 2**31 else reg) for reg in self.registers]}, Flag: {self.flag}"
-        )
-        print(self.memory)
+        # print(
+        #     f"PC: {self.pc}, Executing: {instr}, Registers: {[(-(2**32-reg) if reg >= 2**31 else reg) for reg in self.registers]}, Flag: {self.flag}"
+        # )
+        # print(self.memory)
         next_is_flag_combining = False
         next_is_num_building = False
 
@@ -90,12 +90,14 @@ class Simulator:
                 )
             if self.registers[dst] >= self.registers[src]:
                 self.registers[dst] -= self.registers[src]
+                self.flag = False
             else:
                 self.flag = True
         elif instr.name == "Sub1Cond":
             dst = self.getRegIndex(instr, 0)
             if self.registers[dst] > 0:
                 self.registers[dst] -= 1
+                self.flag = False
             else:
                 self.flag = True
         elif instr.name == "Mult":
@@ -171,9 +173,6 @@ class Simulator:
             src0 = self.getRegIndex(instr, 0)
             src1 = self.getRegIndex(instr, 1)
             self.memory[self.registers[src0]] = self.registers[src1]
-            print(f"src0: {src0}, src1: {src1}")
-            print(self.registers)
-            print(f"Stored {self.registers[src1]} at address {self.registers[src0]}")
         elif instr.name == "Load":
             dst = self.getRegIndex(instr, 0)
             src = self.getRegIndex(instr, 1)
@@ -184,7 +183,7 @@ class Simulator:
         elif instr.name == "Output":
             src = self.getRegIndex(instr, 0)
             self.output.append(self.registers[src])
-            print(f"Output: {self.registers[src]}")
+            # print(f"Output: {self.registers[src]}")
         elif instr.name == "Return":
             raise StopIteration("Program returned")
         elif instr.name == "ADD_IMM_MACRO":
@@ -201,7 +200,7 @@ class Simulator:
         elif instr.name == "LOADBYTEWISE_MACRO":
             dst = self.getRegIndex(instr, 0)
             addr = self.getRegIndex(instr, 1)
-            print(f"Loading bytewise into {dst} from address in {self.registers[addr]}")
+            # print(f"Loading bytewise into {dst} from address in {self.registers[addr]}")
             val = 0
             for i in range(4):
                 assert (
@@ -212,9 +211,6 @@ class Simulator:
         elif instr.name == "STOREBYTEWISE_MACRO":
             src = self.getRegIndex(instr, 0)
             addr = self.getRegIndex(instr, 1)
-            print(
-                f"Storing bytewise from {self.registers[src]} to address in {self.registers[addr]}"
-            )
             for i in range(4):
                 self.memory[self.registers[addr] + i] = (
                     self.registers[src] >> (i * 8)

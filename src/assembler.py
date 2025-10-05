@@ -116,10 +116,10 @@ class Program:
     def fixup_jumps(self):
         for index, instr in enumerate(self.instructions):
             if instr.name in ["JumpFwd", "JumpFwdNF", "JumpBwdNF"]:
-                print(f"Fixing up jump at {index}: {instr}")
-                print(
-                    f"previous instruction: {self.instructions[index-1]}, {self.instructions[index-2]}"
-                )
+                # print(f"Fixing up jump at {index}: {instr}")
+                # print(
+                #     f"previous instruction: {self.instructions[index-1]}, {self.instructions[index-2]}"
+                # )
                 assert (
                     self.instructions[index - 1].name == "NumBuild"
                     and self.instructions[index - 2].name == "NumBuild"
@@ -205,7 +205,7 @@ class Program:
                 elif opcode[i] == -2:
                     opcode[i] = arg_numbers[0]
 
-            print(f"Encoding {instr} as {opcode} (args: {arg_numbers})")
+            # print(f"Encoding {instr} as {opcode} (args: {arg_numbers})")
             for code in opcode:
                 card_name = NUMBER_TO_CARD.get(code)
                 if card_name is None:

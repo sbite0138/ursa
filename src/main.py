@@ -19,6 +19,7 @@ def main():
             simulator.step()
     except StopIteration:
         print("Program finished.")
+        print("Output:")
         for char in simulator.output:
             print(chr(char), end="")
         print()
