@@ -200,6 +200,15 @@ class Simulator:
             src = self.getRegIndex(instr, 0)
             self.output.append(self.registers[src])
             # print(f"Output: {self.registers[src]}")
+        elif instr.name == "AInput" or instr.name == "BInput":
+            dst = self.getRegIndex(instr, 0)
+            who = "Alice" if instr.name == "AInput" else "Bob"
+            try:
+                line = input(f"{who} input> ").strip()
+                value = int(line)
+            except (EOFError, ValueError):
+                value = 0
+            self.registers[dst] = value & 0xFFFFFFFF
         elif instr.name == "Return":
             raise StopIteration("Program returned")
         elif instr.name == "ADD_IMM_MACRO":

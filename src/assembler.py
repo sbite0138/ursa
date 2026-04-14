@@ -22,6 +22,8 @@ INSTRUCTIONS = [
     "Store",
     "Load",
     "Output",
+    "AInput",
+    "BInput",
     "Return",
 ]
 
@@ -65,6 +67,8 @@ INSTRUCTION_TO_OPCODE = {
     "Store": [8, -1, -1],
     "Load": [9, -1, -1],
     "Output": [4, 3, -1],
+    "AInput": [2, -1, 0],
+    "BInput": [2, -1, 1],
     "Return": [3, 7, -1],
 }
 
