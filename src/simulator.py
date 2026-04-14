@@ -11,8 +11,20 @@ class Simulator:
         self.pc = 0  # Program counter
         self.memory = {}
         self.output = []
+        # Return-address stack pushed by Call* and popped by Return. The MtG
+        # spec specifies the pushed value as an "S" used in Return's
+        # PC += max(0, S - 3·Z') formula (where Z' is the callee's
+        # entry-to-return instruction distance); for simulation purposes we
+        # just save the straight-line return address. A Return with an empty
+        # stack halts the program — that's how _start exits.
+        self.return_stack = []
         self.registers[1] = 128
         self.registers[2] = 128
+        # Start execution at the `_start` label if defined, otherwise at the
+        # beginning of the program. Clang / LLVM don't guarantee _start is
+        # first in the asm — the user typically defines helpers alongside it.
+        if "_start" in program.labels:
+            self.pc = program.labels["_start"]
 
     def getImm(self, instr: Instruction, index: int) -> int:
         if index >= len(instr.args):
@@ -209,8 +221,29 @@ class Simulator:
             except (EOFError, ValueError):
                 value = 0
             self.registers[dst] = value & 0xFFFFFFFF
+        elif instr.name == "CallFwd":
+            src = self.getRegIndex(instr, 0)
+            offset = self.registers[src]
+            # Push the return address (next instruction) and jump forward.
+            # step() appends +1 to pc after us, so we leave pc one short of
+            # the target — mirroring how Jumps are handled.
+            self.return_stack.append(self.pc + 1)
+            self.pc += offset
+        elif instr.name == "CallBwd" or instr.name == "CallBwdR":
+            src = self.getRegIndex(instr, 0)
+            offset = self.registers[src]
+            self.return_stack.append(self.pc + 1)
+            # The target may be instruction 0, so pc can legitimately hit -1
+            # here — step() will roll it forward by 1 before the next fetch.
+            self.pc -= offset
         elif instr.name == "Return":
-            raise StopIteration("Program returned")
+            # Empty stack => returning from the outermost function (_start).
+            # The program is done. Non-empty stack => pop and jump back.
+            if not self.return_stack:
+                raise StopIteration("Program returned")
+            # step() adds +1 to pc at the end; subtract 1 so we land exactly
+            # on the saved return address.
+            self.pc = self.return_stack.pop() - 1
         elif instr.name == "ADD_IMM_MACRO":
             dst = self.getRegIndex(instr, 0)
             imm = self.getImm(instr, 1)

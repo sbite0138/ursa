@@ -24,6 +24,9 @@ INSTRUCTIONS = [
     "Output",
     "AInput",
     "BInput",
+    "CallFwd",
+    "CallBwd",
+    "CallBwdR",
     "Return",
 ]
 
@@ -70,6 +73,9 @@ INSTRUCTION_TO_OPCODE = {
     "AInput": [2, -1, 0],
     "BInput": [2, -1, 1],
     "Return": [3, 7, -1],
+    "CallFwd": [3, 6, 0],
+    "CallBwd": [3, 6, 1],
+    "CallBwdR": [3, 6, 2],
 }
 
 NUMBER_TO_CARD = {
@@ -121,7 +127,40 @@ class Program:
     def __repr__(self):
         return f"Program(instructions={self.instructions}, labels={self.labels})"
 
+    def _patch_numbuild_pair(self, index, value):
+        # value must be non-negative. Split into 4 base-12 digits and write
+        # into the 2 NumBuild instructions at index-2 and index-1.
+        assert value >= 0
+        numbuild_args = []
+        v = value
+        for _ in range(4):
+            numbuild_args.append("#" + str(v % 12))
+            v //= 12
+        numbuild_args.reverse()
+        self.instructions[index - 2].args = [numbuild_args[0], numbuild_args[1]]
+        self.instructions[index - 1].args = [numbuild_args[2], numbuild_args[3]]
+
+    def _function_entry_index(self, instr_index):
+        # Return the instruction-stream index of the nearest label at or
+        # before instr_index that doesn't look like a compiler-generated
+        # local MBB label (convention: local labels start with "."). That is
+        # the function entry point per the LLVM AsmPrinter.
+        best = 0
+        for name, idx in self.labels.items():
+            if name.startswith("."):
+                continue
+            if idx <= instr_index and idx > best:
+                best = idx
+        return best
+
     def fixup_jumps(self):
+        # MtG's Jump / Call / Return all use the "NumBuild NumBuild <op>"
+        # pattern where the two NumBuilds materialize a magnitude into r0
+        # and <op> consumes r0 as a PC-relative displacement (Jump/Call) or
+        # an instruction-count offset from the function entry (Return).
+        # LLVM emits the NumBuilds as "#0, #0" placeholders; here we fill in
+        # the real value based on the final program layout — the same role a
+        # real assembler/linker would play for targets like RISC-V.
         JUMP_NAMES = {
             "JumpFwd",
             "JumpBwd",
@@ -130,6 +169,7 @@ class Program:
             "JumpFwdF",
             "JumpBwdF",
         }
+        CALL_NAMES = {"CallFwd", "CallBwd", "CallBwdR"}
         for index, instr in enumerate(self.instructions):
             if instr.name in JUMP_NAMES:
                 assert (
@@ -150,27 +190,40 @@ class Program:
                 if target_value < 0:
                     target_value = -target_value
                 instr.args = ["r0"]
-                numbuild_args = []
-                for _ in range(4):
-                    numbuild_args.append("#" + str(target_value % 12))
-                    target_value //= 12
-                numbuild_args.reverse()
-                self.instructions[index - 2].args = [numbuild_args[0], numbuild_args[1]]
-                self.instructions[index - 1].args = [numbuild_args[2], numbuild_args[3]]
+                self._patch_numbuild_pair(index, target_value)
+            elif instr.name in CALL_NAMES:
+                assert (
+                    self.instructions[index - 1].name == "NumBuild"
+                    and self.instructions[index - 2].name == "NumBuild"
+                )
+                target_label = instr.args[0]
+                if target_label not in self.labels:
+                    raise ValueError(f"Undefined call target: {target_label}")
+                target_index = self.labels[target_label]
+                target_value = target_index - index - 1
+                # Flip CallFwd → CallBwdR if the target is behind us. We
+                # never emit CallBwd (only CallBwdR), since BwdR is safe
+                # for all backward calls including self-recursion (see the
+                # MtG spec notes in the backend README).
+                if target_value < 0 and instr.name == "CallFwd":
+                    instr.name = "CallBwdR"
+                elif target_value > 0 and instr.name in ("CallBwd", "CallBwdR"):
+                    instr.name = "CallFwd"
+                if target_value < 0:
+                    target_value = -target_value
+                instr.args = ["r0"]
+                self._patch_numbuild_pair(index, target_value)
             elif instr.name == "Return":
                 assert (
                     self.instructions[index - 1].name == "NumBuild"
                     and self.instructions[index - 2].name == "NumBuild"
                 )
                 instr.args = ["r0"]
-                target_value = len(self.instructions)
-                numbuild_args = []
-                for _ in range(4):
-                    numbuild_args.append("#" + str(target_value % 12))
-                    target_value //= 12
-                numbuild_args.reverse()
-                self.instructions[index - 2].args = [numbuild_args[0], numbuild_args[1]]
-                self.instructions[index - 1].args = [numbuild_args[2], numbuild_args[3]]
+                # Z' for Return is the instruction-count distance from this
+                # Return back to its containing function's entry label.
+                entry_index = self._function_entry_index(index)
+                target_value = index - entry_index
+                self._patch_numbuild_pair(index, target_value)
 
     def to_assembly(self):
         lines = []
