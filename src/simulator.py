@@ -169,6 +169,22 @@ class Simulator:
                 assert (
                     0 <= self.pc < len(self.program.instructions)
                 ), "Jump out of bounds"
+        elif instr.name == "JumpFwdF":
+            if self.flag:
+                src = self.getRegIndex(instr, 0)
+                offset = self.registers[src]
+                self.pc += offset
+                assert (
+                    0 <= self.pc < len(self.program.instructions)
+                ), "Jump out of bounds"
+        elif instr.name == "JumpBwdF":
+            if self.flag:
+                src = self.getRegIndex(instr, 0)
+                offset = self.registers[src]
+                self.pc -= offset
+                assert (
+                    0 <= self.pc < len(self.program.instructions)
+                ), "Jump out of bounds"
         elif instr.name == "Store":
             src0 = self.getRegIndex(instr, 0)
             src1 = self.getRegIndex(instr, 1)

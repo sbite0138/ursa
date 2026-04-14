@@ -17,6 +17,8 @@ INSTRUCTIONS = [
     "JumpBwd",
     "JumpFwdNF",
     "JumpBwdNF",
+    "JumpFwdF",
+    "JumpBwdF",
     "Store",
     "Load",
     "Output",
@@ -58,6 +60,8 @@ INSTRUCTION_TO_OPCODE = {
     "JumpBwd": [3, 1, -1],
     "JumpFwdNF": [3, 2, -1],
     "JumpBwdNF": [3, 3, -1],
+    "JumpFwdF": [3, 4, -1],
+    "JumpBwdF": [3, 5, -1],
     "Store": [8, -1, -1],
     "Load": [9, -1, -1],
     "Output": [4, 3, -1],
@@ -114,12 +118,16 @@ class Program:
         return f"Program(instructions={self.instructions}, labels={self.labels})"
 
     def fixup_jumps(self):
+        JUMP_NAMES = {
+            "JumpFwd",
+            "JumpBwd",
+            "JumpFwdNF",
+            "JumpBwdNF",
+            "JumpFwdF",
+            "JumpBwdF",
+        }
         for index, instr in enumerate(self.instructions):
-            if instr.name in ["JumpFwd", "JumpFwdNF", "JumpBwdNF"]:
-                # print(f"Fixing up jump at {index}: {instr}")
-                # print(
-                #     f"previous instruction: {self.instructions[index-1]}, {self.instructions[index-2]}"
-                # )
+            if instr.name in JUMP_NAMES:
                 assert (
                     self.instructions[index - 1].name == "NumBuild"
                     and self.instructions[index - 2].name == "NumBuild"
@@ -130,18 +138,13 @@ class Program:
                 target_index = self.labels[target_label]
                 target_value = target_index - index - 1
                 if target_value < 0 and instr.name.startswith("JumpFwd"):
-                    if instr.name == "JumpFwd":
-                        instr.name = "JumpBwd"
-                    else:
-                        assert instr.name == "JumpFwdNF"
-                        instr.name = "JumpBwdNF"
-                    target_value = -target_value
+                    # Flip Fwd → Bwd, preserving the NF / F / "" suffix.
+                    instr.name = "JumpBwd" + instr.name[len("JumpFwd"):]
                 elif target_value > 0 and instr.name.startswith("JumpBwd"):
-                    if instr.name == "JumpBwd":
-                        instr.name = "JumpFwd"
-                    else:
-                        assert instr.name == "JumpBwdNF"
-                        instr.name = "JumpFwdNF"
+                    instr.name = "JumpFwd" + instr.name[len("JumpBwd"):]
+                # The hardware subtracts r0 on JumpBwd, so encode the magnitude.
+                if target_value < 0:
+                    target_value = -target_value
                 instr.args = ["r0"]
                 numbuild_args = []
                 for _ in range(4):
