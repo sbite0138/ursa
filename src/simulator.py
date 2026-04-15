@@ -140,16 +140,19 @@ class Simulator:
                 self.flag = self.registers[src] == 0
             next_is_flag_combining = True
         elif instr.name == "FLess":
+            # Spec: "11 Y Z | flag = (rZ < rY)". The first operand is Y,
+            # the second is Z, so flag ends up as (second < first).
             src0 = self.getRegIndex(instr, 0)
             src1 = self.getRegIndex(instr, 1)
             if src0 == src1:
                 raise ValueError(
                     "FLess instruction cannot have the same source registers"
                 )
+            cmp = self.registers[src1] < self.registers[src0]
             if self.is_flag_combining:
-                self.flag |= self.registers[src0] < self.registers[src1]
+                self.flag |= cmp
             else:
-                self.flag = self.registers[src0] < self.registers[src1]
+                self.flag = cmp
             next_is_flag_combining = True
         elif instr.name == "Halve":
             dst = self.getRegIndex(instr, 0)
@@ -198,9 +201,11 @@ class Simulator:
                     0 <= self.pc < len(self.program.instructions)
                 ), "Jump out of bounds"
         elif instr.name == "Store":
+            # Spec: "8 Y Z | mem[rZ] = rY" — first operand is the value,
+            # second is the address.
             src0 = self.getRegIndex(instr, 0)
             src1 = self.getRegIndex(instr, 1)
-            self.memory[self.registers[src0]] = self.registers[src1]
+            self.memory[self.registers[src1]] = self.registers[src0]
         elif instr.name == "Load":
             dst = self.getRegIndex(instr, 0)
             src = self.getRegIndex(instr, 1)
