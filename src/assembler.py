@@ -132,6 +132,14 @@ class Program:
         # Pre-execution memory image: address -> byte. Populated from
         # .long / .byte directives parsed in the .data section.
         self.global_init = {}
+        # Deferred `.long <symbol>[+offset]` fixups we encountered while
+        # parsing .data. Each entry is (addr, symbol, offset); after the
+        # full file is parsed (all globals registered) resolve_data_fixups
+        # walks this list and writes the symbol's runtime address into
+        # `global_init[addr..addr+4]`. This supports self-referential and
+        # forward-referential data (e.g. linked-list nodes pointing at
+        # each other, or `.long fn` — a function's instruction address).
+        self._data_fixups = []
 
     def add_instruction(self, instruction):
         self.instructions.append(instruction)
@@ -153,6 +161,24 @@ class Program:
 
     def init_memory_byte(self, addr, value):
         self.global_init[addr] = value & 0xFF
+
+    def add_data_fixup(self, addr, symbol, offset):
+        self._data_fixups.append((addr, symbol, offset))
+
+    def resolve_data_fixups(self):
+        for addr, symbol, offset in self._data_fixups:
+            if symbol in self.globals:
+                target = self.globals[symbol] + offset
+            elif symbol in self.labels:
+                # `.long func_name` — let the symbol resolve to its
+                # instruction index. Useful for function-pointer tables
+                # that the runtime dispatches through Call / indirect jumps.
+                target = self.labels[symbol] + offset
+            else:
+                raise ValueError(
+                    f".long references unknown symbol '{symbol}'")
+            self.init_memory_long(addr, target)
+        self._data_fixups = []
 
     def __repr__(self):
         return f"Program(instructions={self.instructions}, labels={self.labels})"
@@ -420,8 +446,19 @@ def parse_file(file_path):
             parts = stripped.split(None, 1)
             directive = parts[0]
             if directive == ".long":
-                value = int(parts[1].split()[0], 0)
-                program.init_memory_long(data_cursor, value)
+                tok = parts[1].split()[0]
+                # Integer literal → write bytes now. Symbol reference
+                # (optionally `sym+N` / `sym-N`) → defer to a fixup pass;
+                # the symbol may not yet be known (forward references,
+                # self-referential linked data) and even when it is, code
+                # labels need fixup_jumps' instruction-address resolution
+                # first.
+                try:
+                    value = int(tok, 0)
+                    program.init_memory_long(data_cursor, value)
+                except ValueError:
+                    sym, offset = _split_sym_offset(tok)
+                    program.add_data_fixup(data_cursor, sym, offset)
                 data_cursor += 4
             elif directive == ".byte":
                 value = int(parts[1].split()[0], 0)
@@ -445,7 +482,26 @@ def parse_file(file_path):
             elif isinstance(parsed_line, Label):
                 program.add_label(parsed_line)
 
+    # Resolve any `.long <symbol>` fixups now that all globals have been
+    # registered. (Code-label references are resolved later in
+    # fixup_jumps, after NumBuildAddr expansion has settled instruction
+    # addresses — but .data symbols are stable as soon as parsing finishes.)
+    program.resolve_data_fixups()
+
     return program
+
+
+def _split_sym_offset(tok):
+    # Parse `sym`, `sym+N`, or `sym-N` into (sym, int_offset).
+    for sep_idx, sep in enumerate(tok):
+        # Skip a leading sign (e.g. no sign in clang output, but be robust).
+        if sep_idx == 0:
+            continue
+        if sep == "+" or sep == "-":
+            sym = tok[:sep_idx]
+            offset = int(tok[sep_idx:], 0)
+            return sym, offset
+    return tok, 0
 
 
 if __name__ == "__main__":
