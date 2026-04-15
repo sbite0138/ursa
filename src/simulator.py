@@ -20,6 +20,11 @@ class Simulator:
         self.return_stack = []
         self.registers[1] = 128
         self.registers[2] = 128
+        # Pre-populate memory with any global initialisers from the .data
+        # section (parsed by the assembler). Globals live above the stack
+        # at addresses >= GLOBALS_BASE.
+        for addr, byte_val in program.global_init.items():
+            self.memory[addr] = byte_val
         # Start execution at the `_start` label if defined, otherwise at the
         # beginning of the program. Clang / LLVM don't guarantee _start is
         # first in the asm — the user typically defines helpers alongside it.

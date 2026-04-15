@@ -44,7 +44,17 @@ MACRO_INSTRUCTIONS = [
     "GT_MACRO",
     "DIV_MACRO",
     "REM_MACRO",
+    # NumBuildAddr <sym> is a meta-instruction emitted by the LLVM
+    # backend's MOVEADDR_MACRO expansion. fixup_jumps replaces each
+    # occurrence with the 4 NumBuild digit pairs that encode the
+    # symbol's runtime address into r0.
+    "NumBuildAddr",
 ]
+
+# Where global variables (data section objects) start in MtG memory.
+# The stack lives below 128 (registers[1] / registers[2] start there in
+# the simulator), so picking 0x400 = 1024 leaves a comfortable gap.
+GLOBALS_BASE = 1024
 
 INSTRUCTION_TO_OPCODE = {
     "Move": [5, -1, -1],
@@ -115,6 +125,13 @@ class Program:
     def __init__(self):
         self.instructions = []
         self.labels = {}
+        # Global symbols defined in the .data section: name -> address.
+        # The address is a byte offset into MtG memory; values are
+        # initialised by the simulator before execution starts.
+        self.globals = {}
+        # Pre-execution memory image: address -> byte. Populated from
+        # .long / .byte directives parsed in the .data section.
+        self.global_init = {}
 
     def add_instruction(self, instruction):
         self.instructions.append(instruction)
@@ -123,6 +140,19 @@ class Program:
         if label.name in self.labels:
             raise ValueError(f"Duplicate label: {label.name}")
         self.labels[label.name] = len(self.instructions)
+
+    def add_global(self, name, addr):
+        if name in self.globals:
+            raise ValueError(f"Duplicate global: {name}")
+        self.globals[name] = addr
+
+    def init_memory_long(self, addr, value):
+        # Little-endian 32-bit byte split.
+        for i in range(4):
+            self.global_init[addr + i] = (value >> (i * 8)) & 0xFF
+
+    def init_memory_byte(self, addr, value):
+        self.global_init[addr] = value & 0xFF
 
     def __repr__(self):
         return f"Program(instructions={self.instructions}, labels={self.labels})"
@@ -153,7 +183,50 @@ class Program:
                 best = idx
         return best
 
+    def expand_global_addr_pseudos(self):
+        # Replace each `NumBuildAddr <sym>` with 4 NumBuild digit pairs
+        # whose base-144 encoding produces the symbol's runtime address
+        # in r0. This is done before fixup_jumps so the new instructions
+        # are part of the linear stream that fixup_jumps walks.
+        new_instrs = []
+        relabel = {}  # old index -> new index, for label fix-up below.
+        for old_idx, instr in enumerate(self.instructions):
+            relabel[old_idx] = len(new_instrs)
+            if instr.name == "NumBuildAddr":
+                if not instr.args:
+                    raise ValueError("NumBuildAddr needs a symbol operand")
+                sym = instr.args[0]
+                if sym not in self.globals:
+                    raise ValueError(f"NumBuildAddr: unknown global '{sym}'")
+                addr = self.globals[sym]
+                # Encode `addr` as 4 base-144 digits, MSB first, mirroring
+                # how MOVEIMM_MACRO expands a constant.
+                pairs = []
+                v = addr
+                for _ in range(4):
+                    pairs.append(v % 144)
+                    v //= 144
+                pairs.reverse()
+                for d in pairs:
+                    new_instrs.append(
+                        Instruction("NumBuild",
+                                    ["#" + str(d // 12), "#" + str(d % 12)]))
+            else:
+                new_instrs.append(instr)
+        # Recompute label positions: every label that pointed at old_idx
+        # now points at relabel[old_idx]. (The next instruction's new
+        # position, since labels are stored as "instruction index of the
+        # next instruction".)
+        new_labels = {}
+        for name, old_pos in self.labels.items():
+            new_labels[name] = relabel.get(old_pos, len(new_instrs))
+        self.instructions = new_instrs
+        self.labels = new_labels
+
     def fixup_jumps(self):
+        # Resolve global-address pseudos first so the resulting NumBuilds
+        # are present when we later look up label / call positions.
+        self.expand_global_addr_pseudos()
         # MtG's Jump / Call / Return all use the "NumBuild NumBuild <op>"
         # pattern where the two NumBuilds materialize a magnitude into r0
         # and <op> consumes r0 as a PC-relative displacement (Jump/Call) or
@@ -300,15 +373,77 @@ def parse_file(file_path):
         lines = file.readlines()
 
     program = Program()
+    # Section state. We walk the asm top-to-bottom and switch between
+    # `.text` (default) and `.data`. Inside `.data`, labels become
+    # global-symbol declarations and `.long` / `.byte` directives
+    # populate the initial memory image.
+    in_data = False
+    data_cursor = GLOBALS_BASE
+
     for line in lines:
         line = line.strip()
-        if line and not line.startswith("#"):  # Ignore empty lines and comments
-            parsed_line = parse_line(line)
-            if parsed_line:
-                if isinstance(parsed_line, Instruction):
-                    program.add_instruction(parsed_line)
-                elif isinstance(parsed_line, Label):
-                    program.add_label(parsed_line)
+        if not line or line.startswith("#"):
+            continue
+
+        # Strip inline comments before peeking at directive type.
+        stripped = line.split(";")[0].strip()
+        if not stripped:
+            continue
+
+        # Section directives. ".text" puts us in instruction-stream
+        # mode; ".data", ".bss", or any explicit ".section <other>"
+        # puts us in data mode. .bss is reached via
+        # `.section .bss,"aw",@nobits` rather than a bare `.bss`.
+        first = stripped.split(None, 1)[0]
+        if first == ".text":
+            in_data = False
+            continue
+        if first == ".data" or first == ".bss":
+            in_data = True
+            continue
+        if first == ".section":
+            rest = stripped[len(".section"):].strip()
+            in_data = not (rest == ".text" or rest.startswith(".text,") or
+                           rest.startswith(".text "))
+            continue
+
+        if in_data:
+            # Label inside .data → global symbol declaration. We assign
+            # the symbol the current data_cursor address.
+            if stripped.endswith(":"):
+                name = stripped[:-1].strip()
+                program.add_global(name, data_cursor)
+                continue
+            # `.long N` (4 bytes), `.byte N` (1 byte). Other directives
+            # (.size, .type, .globl, .p2align, .ident, .section, .addrsig*)
+            # are metadata we don't need to act on.
+            parts = stripped.split(None, 1)
+            directive = parts[0]
+            if directive == ".long":
+                value = int(parts[1].split()[0], 0)
+                program.init_memory_long(data_cursor, value)
+                data_cursor += 4
+            elif directive == ".byte":
+                value = int(parts[1].split()[0], 0)
+                program.init_memory_byte(data_cursor, value)
+                data_cursor += 1
+            elif directive == ".p2align":
+                # Pad data_cursor up to the requested alignment so the
+                # next label sits on a 2^N boundary.
+                pow2 = int(parts[1].split(",")[0])
+                align = 1 << pow2
+                if data_cursor % align != 0:
+                    data_cursor += align - (data_cursor % align)
+            # Everything else in .data is metadata — ignore.
+            continue
+
+        # .text content goes through the regular instruction parser.
+        parsed_line = parse_line(line)
+        if parsed_line:
+            if isinstance(parsed_line, Instruction):
+                program.add_instruction(parsed_line)
+            elif isinstance(parsed_line, Label):
+                program.add_label(parsed_line)
 
     return program
 
