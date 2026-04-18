@@ -49,6 +49,7 @@ MACRO_INSTRUCTIONS = [
     # occurrence with the 4 NumBuild digit pairs that encode the
     # symbol's runtime address into r0.
     "NumBuildAddr",
+    "NOT_MACRO",
 ]
 
 # Where global variables (data section objects) start in MtG memory.
@@ -183,9 +184,23 @@ class Program:
     def __repr__(self):
         return f"Program(instructions={self.instructions}, labels={self.labels})"
 
+    def _patch_numbuild_quad(self, index, value):
+        # value must be non-negative. Split into 8 base-12 digits and write
+        # into the 4 NumBuild instructions at index-4 .. index-1.
+        assert value >= 0
+        numbuild_args = []
+        v = value
+        for _ in range(8):
+            numbuild_args.append("#" + str(v % 12))
+            v //= 12
+        numbuild_args.reverse()
+        for i in range(4):
+            self.instructions[index - 4 + i].args = [
+                numbuild_args[i * 2], numbuild_args[i * 2 + 1]
+            ]
+
     def _patch_numbuild_pair(self, index, value):
-        # value must be non-negative. Split into 4 base-12 digits and write
-        # into the 2 NumBuild instructions at index-2 and index-1.
+        # Legacy 2-pair compat: split into 4 base-12 digits.
         assert value >= 0
         numbuild_args = []
         v = value
@@ -271,39 +286,33 @@ class Program:
         CALL_NAMES = {"CallFwd", "CallBwd", "CallBwdR"}
         for index, instr in enumerate(self.instructions):
             if instr.name in JUMP_NAMES:
-                assert (
-                    self.instructions[index - 1].name == "NumBuild"
-                    and self.instructions[index - 2].name == "NumBuild"
-                )
+                assert all(
+                    self.instructions[index - 1 - i].name == "NumBuild"
+                    for i in range(4)
+                ), f"Expected 4 NumBuild before {instr.name} at index {index}"
                 target_label = instr.args[0]
                 if target_label not in self.labels:
                     raise ValueError(f"Undefined label: {target_label}")
                 target_index = self.labels[target_label]
                 target_value = target_index - index - 1
                 if target_value < 0 and instr.name.startswith("JumpFwd"):
-                    # Flip Fwd → Bwd, preserving the NF / F / "" suffix.
                     instr.name = "JumpBwd" + instr.name[len("JumpFwd"):]
                 elif target_value > 0 and instr.name.startswith("JumpBwd"):
                     instr.name = "JumpFwd" + instr.name[len("JumpBwd"):]
-                # The hardware subtracts r0 on JumpBwd, so encode the magnitude.
                 if target_value < 0:
                     target_value = -target_value
                 instr.args = ["r0"]
-                self._patch_numbuild_pair(index, target_value)
+                self._patch_numbuild_quad(index, target_value)
             elif instr.name in CALL_NAMES:
-                assert (
-                    self.instructions[index - 1].name == "NumBuild"
-                    and self.instructions[index - 2].name == "NumBuild"
-                )
+                assert all(
+                    self.instructions[index - 1 - i].name == "NumBuild"
+                    for i in range(4)
+                ), f"Expected 4 NumBuild before {instr.name} at index {index}"
                 target_label = instr.args[0]
                 if target_label not in self.labels:
                     raise ValueError(f"Undefined call target: {target_label}")
                 target_index = self.labels[target_label]
                 target_value = target_index - index - 1
-                # Flip CallFwd → CallBwdR if the target is behind us. We
-                # never emit CallBwd (only CallBwdR), since BwdR is safe
-                # for all backward calls including self-recursion (see the
-                # MtG spec notes in the backend README).
                 if target_value < 0 and instr.name == "CallFwd":
                     instr.name = "CallBwdR"
                 elif target_value > 0 and instr.name in ("CallBwd", "CallBwdR"):
@@ -311,18 +320,16 @@ class Program:
                 if target_value < 0:
                     target_value = -target_value
                 instr.args = ["r0"]
-                self._patch_numbuild_pair(index, target_value)
+                self._patch_numbuild_quad(index, target_value)
             elif instr.name == "Return":
-                assert (
-                    self.instructions[index - 1].name == "NumBuild"
-                    and self.instructions[index - 2].name == "NumBuild"
-                )
+                assert all(
+                    self.instructions[index - 1 - i].name == "NumBuild"
+                    for i in range(4)
+                ), f"Expected 4 NumBuild before Return at index {index}"
                 instr.args = ["r0"]
-                # Z' for Return is the instruction-count distance from this
-                # Return back to its containing function's entry label.
                 entry_index = self._function_entry_index(index)
                 target_value = index - entry_index
-                self._patch_numbuild_pair(index, target_value)
+                self._patch_numbuild_quad(index, target_value)
 
     def to_assembly(self):
         lines = []
@@ -433,6 +440,20 @@ def parse_file(file_path):
                            rest.startswith(".text "))
             continue
 
+        # .comm directive: allocate BSS global (can appear in any section).
+        if first == ".comm":
+            # .comm name,size,align
+            parts = stripped[len(".comm"):].strip().split(",")
+            name = parts[0].strip()
+            size = int(parts[1].strip())
+            if len(parts) >= 3:
+                align = int(parts[2].strip())
+                if data_cursor % align != 0:
+                    data_cursor += align - (data_cursor % align)
+            program.add_global(name, data_cursor)
+            data_cursor += size
+            continue
+
         if in_data:
             # Label inside .data → global symbol declaration. We assign
             # the symbol the current data_cursor address.
@@ -440,19 +461,10 @@ def parse_file(file_path):
                 name = stripped[:-1].strip()
                 program.add_global(name, data_cursor)
                 continue
-            # `.long N` (4 bytes), `.byte N` (1 byte). Other directives
-            # (.size, .type, .globl, .p2align, .ident, .section, .addrsig*)
-            # are metadata we don't need to act on.
             parts = stripped.split(None, 1)
             directive = parts[0]
             if directive == ".long":
                 tok = parts[1].split()[0]
-                # Integer literal → write bytes now. Symbol reference
-                # (optionally `sym+N` / `sym-N`) → defer to a fixup pass;
-                # the symbol may not yet be known (forward references,
-                # self-referential linked data) and even when it is, code
-                # labels need fixup_jumps' instruction-address resolution
-                # first.
                 try:
                     value = int(tok, 0)
                     program.init_memory_long(data_cursor, value)
@@ -465,8 +477,6 @@ def parse_file(file_path):
                 program.init_memory_byte(data_cursor, value)
                 data_cursor += 1
             elif directive == ".p2align":
-                # Pad data_cursor up to the requested alignment so the
-                # next label sits on a 2^N boundary.
                 pow2 = int(parts[1].split(",")[0])
                 align = 1 << pow2
                 if data_cursor % align != 0:

@@ -319,6 +319,9 @@ class Simulator:
             dst = self.getRegIndex(instr, 0)
             src = self.getRegIndex(instr, 1)
             self.registers[dst] = self.registers[dst] % self.registers[src]
+        elif instr.name == "NOT_MACRO":
+            dst = self.getRegIndex(instr, 0)
+            self.registers[dst] = 0xFFFFFFFF ^ self.registers[dst]
 
         elif instr.name == "RET_PSEUDO":
             raise StopIteration("Program returned")
