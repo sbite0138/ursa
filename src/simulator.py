@@ -254,77 +254,12 @@ class Simulator:
             # step() adds +1 to pc at the end; subtract 1 so we land exactly
             # on the saved return address.
             self.pc = self.return_stack.pop() - 1
-        elif instr.name == "ADD_IMM_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            imm = self.getImm(instr, 1)
-            self.registers[dst] += imm
-        elif instr.name == "ADD_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            self.registers[dst] += self.registers[src]
-        elif instr.name == "NUMBUILD_MACRO":
-            imm = self.getImm(instr, 0)
-            self.registers[0] = imm
-        elif instr.name == "LOADBYTEWISE_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            addr = self.getRegIndex(instr, 1)
-            # print(f"Loading bytewise into {dst} from address in {self.registers[addr]}")
-            val = 0
-            for i in range(4):
-                assert (
-                    self.registers[addr] + i in self.memory
-                ), f"Memory read from uninitialized address: {self.registers[addr] + i}"
-                val |= self.memory.get(self.registers[addr] + i, 0) << (i * 8)
-            self.registers[dst] = val
-        elif instr.name == "STOREBYTEWISE_MACRO":
-            src = self.getRegIndex(instr, 0)
-            addr = self.getRegIndex(instr, 1)
-            for i in range(4):
-                self.memory[self.registers[addr] + i] = (
-                    self.registers[src] >> (i * 8)
-                ) & 0xFF
-        elif instr.name == "GT_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            src0 = self.getRegIndex(instr, 1)
-            src1 = self.getRegIndex(instr, 2)
-            self.registers[dst] = (
-                1 if self.registers[src0] > self.registers[src1] else 0
-            )
-        elif instr.name == "EQ_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            src0 = self.getRegIndex(instr, 1)
-            src1 = self.getRegIndex(instr, 2)
-            self.registers[dst] = (
-                1 if self.registers[src0] == self.registers[src1] else 0
-            )
-        elif instr.name == "NEQ_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            src0 = self.getRegIndex(instr, 1)
-            src1 = self.getRegIndex(instr, 2)
-            self.registers[dst] = (
-                1 if self.registers[src0] != self.registers[src1] else 0
-            )
-        elif instr.name == "LT_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            src0 = self.getRegIndex(instr, 1)
-            src1 = self.getRegIndex(instr, 2)
-            self.registers[dst] = (
-                1 if self.registers[src0] < self.registers[src1] else 0
-            )
-        elif instr.name == "DIV_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            self.registers[dst] = self.registers[dst] // self.registers[src]
-        elif instr.name == "REM_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            self.registers[dst] = self.registers[dst] % self.registers[src]
-        elif instr.name == "NOT_MACRO":
-            dst = self.getRegIndex(instr, 0)
-            self.registers[dst] = 0xFFFFFFFF ^ self.registers[dst]
-
-        elif instr.name == "RET_PSEUDO":
-            raise StopIteration("Program returned")
+        # All _MACRO / _PSEUDO handlers (ADD_MACRO, NUMBUILD_MACRO, LT_MACRO,
+        # DIV_MACRO, RET_PSEUDO, ...) have been removed: the LLVM backend now
+        # expands every such pseudo into native instructions before emission.
+        # The single exception is NumBuildAddr, which is resolved into 4
+        # native NumBuild pairs by assembler.py's fixup pass before the
+        # simulator ever sees it — see expand_global_addr_pseudos().
         else:
             raise ValueError(f"Unhandled instruction: {instr.name}")
         self.pc += 1

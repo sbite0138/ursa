@@ -31,25 +31,15 @@ INSTRUCTIONS = [
 ]
 
 MACRO_INSTRUCTIONS = [
-    "ADD_IMM_MACRO",
-    "ADD_MACRO",
-    "NUMBUILD_MACRO",
-    "LOADBYTEWISE_MACRO",
-    "STOREBYTEWISE_MACRO",
-    "RET_PSEUDO",
-    #
-    "EQ_MACRO",
-    "NEQ_MACRO",
-    "LT_MACRO",
-    "GT_MACRO",
-    "DIV_MACRO",
-    "REM_MACRO",
     # NumBuildAddr <sym> is a meta-instruction emitted by the LLVM
     # backend's MOVEADDR_MACRO expansion. fixup_jumps replaces each
     # occurrence with the 4 NumBuild digit pairs that encode the
-    # symbol's runtime address into r0.
+    # symbol's runtime address into r0. This is the only MACRO / pseudo
+    # LLVM still emits into the final .s — every other pseudo is now
+    # expanded backend-side into native instructions. The plan (Epic
+    # 2-2) is to move NumBuildAddr resolution into mtg-link.py so ursa
+    # only ever sees native instructions; until then, this entry stays.
     "NumBuildAddr",
-    "NOT_MACRO",
 ]
 
 # Where global variables (data section objects) start in MtG memory.
