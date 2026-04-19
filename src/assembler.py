@@ -30,17 +30,18 @@ INSTRUCTIONS = [
     "Return",
 ]
 
-MACRO_INSTRUCTIONS = [
-    # NumBuildAddr <sym> is a meta-instruction emitted by the LLVM
-    # backend's MOVEADDR_MACRO expansion. fixup_jumps replaces each
-    # occurrence with the 4 NumBuild digit pairs that encode the
-    # symbol's runtime address into r0. This is the only MACRO / pseudo
-    # LLVM still emits into the final .s — every other pseudo is now
-    # expanded backend-side into native instructions. The plan (Epic
-    # 2-2) is to move NumBuildAddr resolution into mtg-link.py so ursa
-    # only ever sees native instructions; until then, this entry stays.
-    "NumBuildAddr",
-]
+MACRO_INSTRUCTIONS = []
+# Historical note: ursa used to accept MACRO / PSEUDO opcodes
+# (ADD_MACRO, LT_MACRO, NumBuildAddr, ...) and expand them at assembly
+# time. Those responsibilities have migrated:
+#   * Every arithmetic / comparison / load-store MACRO is now expanded
+#     by the LLVM backend before emission (Epic 2-1, 2-3).
+#   * NumBuildAddr is resolved by tools/mtg-link.py, which rewrites
+#     each occurrence into 4 concrete NumBuild digit pairs before the
+#     file reaches ursa (Epic 2-2).
+# ursa therefore only accepts native instructions. Feed raw clang
+# output through mtg-link.py first; a bare NumBuildAddr will trip
+# the "unknown instruction" error below.
 
 # Where global variables (data section objects) start in MtG memory.
 # The stack lives below 128 (registers[1] / registers[2] start there in
@@ -214,50 +215,7 @@ class Program:
                 best = idx
         return best
 
-    def expand_global_addr_pseudos(self):
-        # Replace each `NumBuildAddr <sym>` with 4 NumBuild digit pairs
-        # whose base-144 encoding produces the symbol's runtime address
-        # in r0. This is done before fixup_jumps so the new instructions
-        # are part of the linear stream that fixup_jumps walks.
-        new_instrs = []
-        relabel = {}  # old index -> new index, for label fix-up below.
-        for old_idx, instr in enumerate(self.instructions):
-            relabel[old_idx] = len(new_instrs)
-            if instr.name == "NumBuildAddr":
-                if not instr.args:
-                    raise ValueError("NumBuildAddr needs a symbol operand")
-                sym = instr.args[0]
-                if sym not in self.globals:
-                    raise ValueError(f"NumBuildAddr: unknown global '{sym}'")
-                addr = self.globals[sym]
-                # Encode `addr` as 4 base-144 digits, MSB first, mirroring
-                # how MOVEIMM_MACRO expands a constant.
-                pairs = []
-                v = addr
-                for _ in range(4):
-                    pairs.append(v % 144)
-                    v //= 144
-                pairs.reverse()
-                for d in pairs:
-                    new_instrs.append(
-                        Instruction("NumBuild",
-                                    ["#" + str(d // 12), "#" + str(d % 12)]))
-            else:
-                new_instrs.append(instr)
-        # Recompute label positions: every label that pointed at old_idx
-        # now points at relabel[old_idx]. (The next instruction's new
-        # position, since labels are stored as "instruction index of the
-        # next instruction".)
-        new_labels = {}
-        for name, old_pos in self.labels.items():
-            new_labels[name] = relabel.get(old_pos, len(new_instrs))
-        self.instructions = new_instrs
-        self.labels = new_labels
-
     def fixup_jumps(self):
-        # Resolve global-address pseudos first so the resulting NumBuilds
-        # are present when we later look up label / call positions.
-        self.expand_global_addr_pseudos()
         # MtG's Jump / Call / Return all use the "NumBuild NumBuild <op>"
         # pattern where the two NumBuilds materialize a magnitude into r0
         # and <op> consumes r0 as a PC-relative displacement (Jump/Call) or

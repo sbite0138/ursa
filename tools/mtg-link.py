@@ -2,7 +2,10 @@
 """mtg-link: Text-based linker for MtG assembly files.
 
 Merges multiple .s files produced by `clang --target=mtg` into a single
-.s file that ursa can assemble and simulate.
+.s file that ursa can assemble and simulate. Also resolves each
+`NumBuildAddr <sym>` meta-instruction (the only non-native opcode the
+LLVM backend still emits) into four concrete NumBuild digit pairs, so
+ursa sees a purely-native instruction stream.
 
 Usage:
     python3 mtg-link.py file1.s file2.s ... -o output.s
@@ -11,6 +14,12 @@ Usage:
 import argparse
 import re
 import sys
+
+
+# Runtime base address for .data / .bss globals. Must match
+# ursa/src/assembler.py's GLOBALS_BASE — they jointly define the ABI
+# between mtg-link (address assignment) and ursa (memory layout).
+GLOBALS_BASE = 1024
 
 
 def parse_sections(lines, file_idx):
@@ -102,6 +111,95 @@ def extract_global_labels(lines):
     return labels
 
 
+def compute_data_addresses(all_data, merged_comms):
+    """Return {symbol -> runtime byte address} for every .data / .comm global.
+
+    Mirrors ursa/src/assembler.py's data-cursor logic exactly: .data
+    blocks are walked in file order (same order they'll appear in our
+    linked output), `.long` advances the cursor by 4, `.byte` by 1,
+    `.p2align N` rounds up to the next 1<<N boundary; labels capture
+    the current cursor. `.comm` globals are placed after all .data
+    content, in insertion order of merged_comms, each respecting its
+    alignment.
+    """
+    addrs = {}
+    cursor = GLOBALS_BASE
+
+    for block in all_data:
+        for line in block:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Strip inline comments to match ursa's parser
+            bare = stripped.split(";")[0].strip()
+            if not bare:
+                continue
+            if bare.endswith(":"):
+                name = bare[:-1].strip()
+                addrs[name] = cursor
+                continue
+            parts = bare.split(None, 1)
+            if not parts:
+                continue
+            directive = parts[0]
+            if directive == ".long":
+                cursor += 4
+            elif directive == ".byte":
+                cursor += 1
+            elif directive == ".p2align":
+                pow2 = int(parts[1].split(",")[0])
+                align = 1 << pow2
+                if cursor % align != 0:
+                    cursor += align - (cursor % align)
+            # Other directives (metadata) don't move the cursor.
+
+    for name, (size, align) in merged_comms.items():
+        if cursor % align != 0:
+            cursor += align - (cursor % align)
+        addrs[name] = cursor
+        cursor += size
+
+    return addrs
+
+
+def expand_numbuildaddr(text_lines, addrs):
+    """Replace each `NumBuildAddr <sym>` with 4 `NumBuild #X, #Y` pairs.
+
+    The 4 pairs encode the symbol's resolved address as 4 base-144
+    digits (MSB first), matching the shape ursa's fixup_jumps used to
+    produce. Each NumBuild is written with the same leading whitespace
+    as the original line so downstream tooling preserves formatting.
+    """
+    out = []
+    for line in text_lines:
+        stripped = line.strip()
+        bare = stripped.split(";")[0].strip()
+        if not bare or not bare.startswith("NumBuildAddr"):
+            out.append(line)
+            continue
+        # NumBuildAddr is a unary pseudo: "NumBuildAddr <sym>".
+        parts = bare.split(None, 1)
+        if len(parts) < 2:
+            raise ValueError(f"NumBuildAddr needs a symbol operand: {line!r}")
+        sym = parts[1].strip()
+        if sym not in addrs:
+            raise ValueError(
+                f"NumBuildAddr: unknown global '{sym}' "
+                f"(known: {sorted(addrs)[:8]}{'...' if len(addrs) > 8 else ''})")
+        addr = addrs[sym]
+        # base-144 digits, MSB first.
+        pairs = []
+        v = addr
+        for _ in range(4):
+            pairs.append(v % 144)
+            v //= 144
+        pairs.reverse()
+        indent = line[: len(line) - len(line.lstrip())]
+        for d in pairs:
+            out.append(f"{indent}NumBuild\t #{d // 12}, #{d % 12}")
+    return out
+
+
 def link(input_files, output_file):
     all_text = []
     all_data = []
@@ -149,6 +247,17 @@ def link(input_files, output_file):
     for sym in data_defined_symbols:
         merged_comms.pop(sym, None)
 
+    # Resolve NumBuildAddr: compute every global's final address from
+    # the .data / .comm layout, then rewrite each NumBuildAddr
+    # occurrence into 4 concrete NumBuild digit pairs. After this,
+    # ursa sees only native instructions.
+    global_addrs = compute_data_addresses(all_data, merged_comms)
+    num_numbuildaddr = sum(
+        1 for block in all_text for line in block
+        if line.strip().split(";")[0].strip().startswith("NumBuildAddr")
+    )
+    all_text = [expand_numbuildaddr(block, global_addrs) for block in all_text]
+
     # Write merged output
     with open(output_file, "w") as f:
         f.write("\t.text\n")
@@ -168,7 +277,8 @@ def link(input_files, output_file):
     print(f"[mtg-link] {len(input_files)} files -> {output_file} "
           f"({sum(len(b) for b in all_text)} text lines, "
           f"{sum(len(b) for b in all_data)} data lines, "
-          f"{len(merged_comms)} .comm symbols)",
+          f"{len(merged_comms)} .comm symbols, "
+          f"{num_numbuildaddr} NumBuildAddr resolved)",
           file=sys.stderr)
 
 
