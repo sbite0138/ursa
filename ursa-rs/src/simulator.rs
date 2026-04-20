@@ -22,6 +22,11 @@ pub struct Simulator {
     pub output: Vec<u64>,
     pub return_stack: Vec<i64>,
     pub mem_default_zero: bool,
+    /// Debug: visit counter for ursa pc buckets (1024-instruction granularity).
+    /// Enabled with --trace-pc. Zero when disabled so the hot path pays
+    /// no cost.
+    pub pc_hist: Vec<u64>,
+    pub pc_hist_enabled: bool,
 }
 
 impl Simulator {
@@ -48,7 +53,16 @@ impl Simulator {
             output: Vec::new(),
             return_stack: Vec::new(),
             mem_default_zero,
+            pc_hist: Vec::new(),
+            pc_hist_enabled: false,
         }
+    }
+
+    pub fn enable_pc_hist(&mut self) {
+        let n = self.program.instructions.len();
+        let buckets = (n + 1023) / 1024;
+        self.pc_hist = vec![0; buckets];
+        self.pc_hist_enabled = true;
     }
 
     #[inline]
@@ -57,6 +71,12 @@ impl Simulator {
         let n = instrs.len() as i64;
         if self.pc < 0 || self.pc >= n {
             return StepResult::Halt;
+        }
+        if self.pc_hist_enabled {
+            let bucket = (self.pc as usize) / 1024;
+            if bucket < self.pc_hist.len() {
+                self.pc_hist[bucket] += 1;
+            }
         }
         let instr = &instrs[self.pc as usize];
         let a = &instr.iargs;

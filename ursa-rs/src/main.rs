@@ -20,6 +20,8 @@ struct Args {
     source: String,
     roms: Vec<(String, u64)>,
     zero_mem: bool,
+    trace_pc: bool,
+    max_steps: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -28,6 +30,8 @@ fn parse_args() -> Result<Args, String> {
     let mut source = None;
     let mut roms = Vec::new();
     let mut zero_mem = false;
+    let mut trace_pc = false;
+    let mut max_steps = None;
     while let Some(arg) = a.next() {
         if arg == "--rom" {
             let spec = a.next().ok_or("--rom needs PATH@ADDR")?;
@@ -42,6 +46,11 @@ fn parse_args() -> Result<Args, String> {
             roms.push((path.to_string(), addr));
         } else if arg == "--zero-mem" {
             zero_mem = true;
+        } else if arg == "--trace-pc" {
+            trace_pc = true;
+        } else if arg == "--max-steps" {
+            let v = a.next().ok_or("--max-steps needs N")?;
+            max_steps = Some(v.parse::<u64>().map_err(|e| e.to_string())?);
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {}", arg));
         } else if source.is_none() {
@@ -54,6 +63,8 @@ fn parse_args() -> Result<Args, String> {
         source: source.ok_or("missing source file")?,
         roms,
         zero_mem,
+        trace_pc,
+        max_steps,
     })
 }
 
@@ -91,6 +102,9 @@ fn main() -> ExitCode {
     );
 
     let mut sim = simulator::Simulator::new(program, args.zero_mem);
+    if args.trace_pc {
+        sim.enable_pc_hist();
+    }
 
     for (path, addr) in &args.roms {
         let data = match fs::read(path) {
@@ -115,6 +129,23 @@ fn main() -> ExitCode {
     let mut steps: u64 = 0;
     let mut last_tick = t0;
     loop {
+        if let Some(m) = args.max_steps {
+            if steps >= m {
+                let elapsed = t0.elapsed();
+                flush_output(&mut sim);
+                println!("\n[ursa-rs] hit --max-steps={}", m);
+                eprintln!(
+                    "[ursa-rs] {} steps in {:.3}s ({:.0} steps/s)",
+                    steps,
+                    elapsed.as_secs_f64(),
+                    (steps as f64) / elapsed.as_secs_f64()
+                );
+                if args.trace_pc {
+                    dump_pc_hist(&sim);
+                }
+                return ExitCode::SUCCESS;
+            }
+        }
         match sim.step() {
             simulator::StepResult::Ok => {}
             simulator::StepResult::Halt => {
@@ -127,6 +158,9 @@ fn main() -> ExitCode {
                     elapsed.as_secs_f64(),
                     (steps as f64) / elapsed.as_secs_f64()
                 );
+                if args.trace_pc {
+                    dump_pc_hist(&sim);
+                }
                 return ExitCode::SUCCESS;
             }
             simulator::StepResult::Err(e) => {
@@ -163,5 +197,28 @@ fn flush_output(sim: &mut simulator::Simulator) {
         std::io::stdout().write_all(&bytes).ok();
         std::io::stdout().flush().ok();
         sim.output.clear();
+    }
+}
+
+fn dump_pc_hist(sim: &simulator::Simulator) {
+    eprintln!("[ursa-rs] pc histogram (top 20 buckets, 1024 instructions each):");
+    let mut pairs: Vec<(usize, u64)> = sim
+        .pc_hist
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(i, &c)| (i, c))
+        .collect();
+    pairs.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+    for (i, (bucket, count)) in pairs.iter().take(20).enumerate() {
+        let pc_start = bucket * 1024;
+        let pc_end = pc_start + 1023;
+        eprintln!(
+            "  #{:2}  bucket pc={}..{}  hits={}",
+            i + 1,
+            pc_start,
+            pc_end,
+            count
+        );
     }
 }
