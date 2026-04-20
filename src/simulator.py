@@ -2,7 +2,7 @@ from assembler import Instruction, Label, Program, INSTRUCTIONS, MACRO_INSTRUCTI
 
 
 class Simulator:
-    def __init__(self, program: Program):
+    def __init__(self, program: Program, mem_default_zero: bool = False):
         self.program = program
         self.registers = [0] * 12
         self.flag = False
@@ -10,6 +10,12 @@ class Simulator:
         self.is_num_building = False
         self.pc = 0  # Program counter
         self.memory = {}
+        # When True, reads from uninitialized memory return 0 instead of
+        # raising. Real kernels (Linux, xv6, etc.) rely on standard BSS
+        # semantics and touch large uninitialized regions; the explicit
+        # error is useful for debugging small programs but gets in the
+        # way for full-system boots. Toggled via ursa main.py --zero-mem.
+        self.mem_default_zero = mem_default_zero
         self.output = []
         # Return-address stack pushed by Call* and popped by Return. The MtG
         # spec specifies the pushed value as an "S" used in Return's
@@ -216,7 +222,8 @@ class Simulator:
             src = self.getRegIndex(instr, 1)
             addr = self.registers[src]
             if addr not in self.memory:
-                raise ValueError(f"Memory read from uninitialized address: {addr}")
+                if not self.mem_default_zero:
+                    raise ValueError(f"Memory read from uninitialized address: {addr}")
             self.registers[dst] = self.memory.get(addr, 0)
         elif instr.name == "Output":
             src = self.getRegIndex(instr, 0)

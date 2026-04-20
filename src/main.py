@@ -32,11 +32,22 @@ def main():
             "the cost of embedding them as .long data in the .s."
         ),
     )
+    parser.add_argument(
+        "--zero-mem",
+        action="store_true",
+        help=(
+            "Return 0 for reads from uninitialized memory instead of "
+            "raising. Needed for full-system boots where the kernel "
+            "touches arbitrary BSS ranges it hasn't written yet; leave "
+            "off for small test programs where an uninitialized read is "
+            "almost certainly a bug."
+        ),
+    )
     args = parser.parse_args()
 
     program = parse_file(args.source)
     program.fixup_jumps()
-    simulator = Simulator(program)
+    simulator = Simulator(program, mem_default_zero=args.zero_mem)
 
     # Preload any --rom payloads straight into the simulator's memory
     # dict (same dict .comm / .long writes land in). Each byte of the
