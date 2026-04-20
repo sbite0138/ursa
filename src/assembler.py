@@ -97,9 +97,16 @@ NUMBER_TO_CARD = {
 
 
 class Instruction:
+    __slots__ = ("name", "args", "iargs")
+
     def __init__(self, name, args):
         self.name = name
         self.args = args
+        # Pre-parsed numeric forms of the args, filled in by
+        # Program.finalize(): registers "rN" → N, immediates "#N" → N.
+        # The simulator hot path reads `iargs` directly to dodge the
+        # per-step cost of string parsing and bounds checks.
+        self.iargs = None
 
     def __repr__(self):
         return f"Instruction(name={self.name}, args={self.args})"
@@ -278,6 +285,26 @@ class Program:
                 entry_index = self._function_entry_index(index)
                 target_value = index - entry_index
                 self._patch_numbuild_quad(index, target_value)
+
+        # Pre-parse every instruction's args into integers so the
+        # simulator hot path doesn't have to do string.startswith() +
+        # int() on every step. Profile on a 1M-step Linux boot run
+        # showed ~50% of time going to getRegIndex / getImm / len()
+        # before this; after, the if-elif dispatch dominates.
+        for instr in self.instructions:
+            parsed = []
+            for a in instr.args:
+                if not a:
+                    parsed.append(0)
+                elif a[0] == "r":
+                    parsed.append(int(a[1:]))
+                elif a[0] == "#":
+                    parsed.append(int(a[1:]))
+                else:
+                    # Unresolved label or other textual arg; leave as 0.
+                    # Jumps / calls / returns all get numeric args above.
+                    parsed.append(0)
+            instr.iargs = parsed
 
     def to_assembly(self):
         lines = []

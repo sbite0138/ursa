@@ -67,208 +67,153 @@ class Simulator:
             raise ValueError(f"Invalid register: {arg}")
 
     def step(self):
-        if self.pc >= len(self.program.instructions):
+        # Hot path. Keeps per-step cost down by:
+        #   (1) reading pre-parsed integer args from `instr.iargs` so we
+        #       never re-parse "rN"/"#N" strings (profile showed this
+        #       was ~50% of time);
+        #   (2) aliasing `self.registers` / `self.program.instructions`
+        #       / `self.memory` into locals so each uses one bytecode op
+        #       instead of two attribute lookups per access;
+        #   (3) dropping the `instr.name in INSTRUCTIONS` membership
+        #       check — an unknown name falls through to the else
+        #       branch below, same user-visible error.
+        regs = self.registers
+        instrs = self.program.instructions
+        n_instrs = len(instrs)
+        pc = self.pc
+        if pc >= n_instrs:
             raise StopIteration("End of program")
-        instr = self.program.instructions[self.pc]
-        # print(
-        #     f"PC: {self.pc}, Executing: {instr}, Registers: {[(-(2**32-reg) if reg >= 2**31 else reg) for reg in self.registers]}, Flag: {self.flag}"
-        # )
-        # print(self.memory)
+        instr = instrs[pc]
+        name = instr.name
+        a = instr.iargs
+        mem = self.memory
+        flag = self.flag
+        is_num_building = self.is_num_building
+        is_flag_combining = self.is_flag_combining
+
         next_is_flag_combining = False
         next_is_num_building = False
 
-        if instr.name not in INSTRUCTIONS and instr.name not in MACRO_INSTRUCTIONS:
-            raise ValueError(f"Unknown instruction: {instr.name}")
-        if instr.name == "NumBuild":
-            imm = self.getImm(instr, 0) * 12 + self.getImm(instr, 1)
-            if self.is_num_building:
-                self.registers[0] = self.registers[0] * 144 + imm
+        if name == "NumBuild":
+            imm = a[0] * 12 + a[1]
+            if is_num_building:
+                regs[0] = regs[0] * 144 + imm
             else:
-                self.registers[0] = imm
+                regs[0] = imm
             next_is_num_building = True
-        elif instr.name == "Move":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            if dst == src:
-                raise ValueError(
-                    "Move instruction cannot have the same source and destination register"
-                )
-            self.registers[dst] = self.registers[src]
-        elif instr.name == "Zero":
-            dst = self.getRegIndex(instr, 0)
-            self.registers[dst] = 0
-        elif instr.name == "Add":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            self.registers[dst] += self.registers[src]
-        elif instr.name == "Add1":
-            dst = self.getRegIndex(instr, 0)
-            self.registers[dst] += 1
-        elif instr.name == "SubCond":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            if dst == src:
-                raise ValueError(
-                    "SubCond instruction cannot have the same source and destination register"
-                )
-            if self.registers[dst] >= self.registers[src]:
-                self.registers[dst] -= self.registers[src]
-                self.flag = False
+        elif name == "Add":
+            regs[a[0]] += regs[a[1]]
+        elif name == "SubCond":
+            d = a[0]; s = a[1]
+            vd = regs[d]; vs = regs[s]
+            if vd >= vs:
+                regs[d] = vd - vs
+                flag = False
             else:
-                self.flag = True
-        elif instr.name == "Sub1Cond":
-            dst = self.getRegIndex(instr, 0)
-            if self.registers[dst] > 0:
-                self.registers[dst] -= 1
-                self.flag = False
-            else:
-                self.flag = True
-        elif instr.name == "Mult":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            self.registers[dst] *= self.registers[src]
-        elif instr.name == "Divide":
-            dst = self.getRegIndex(instr, 0)
-            assert (
-                dst != 0 and dst != 6 and self.registers[0] != 0
-            ), "Division by zero or invalid destination register"
-            quot = self.registers[dst] // self.registers[0]
-            rem = self.registers[dst] % self.registers[0]
-            self.registers[dst] = rem
-            self.registers[6] = quot
-            self.flag = quot != 0
-        elif instr.name == "SetF":
-            dst = self.getRegIndex(instr, 0)
-            self.registers[dst] = 1 if self.flag else 0
-        elif instr.name == "SetNF":
-            dst = self.getRegIndex(instr, 0)
-            self.registers[dst] = 0 if self.flag else 1
-        elif instr.name == "FIsZero":
-            src = self.getRegIndex(instr, 0)
-            if self.is_flag_combining:
-                self.flag |= self.registers[src] == 0
-            else:
-                self.flag = self.registers[src] == 0
-            next_is_flag_combining = True
-        elif instr.name == "FLess":
-            # Spec: "11 Y Z | flag = (rZ < rY)". The first operand is Y,
-            # the second is Z, so flag ends up as (second < first).
-            src0 = self.getRegIndex(instr, 0)
-            src1 = self.getRegIndex(instr, 1)
-            if src0 == src1:
-                raise ValueError(
-                    "FLess instruction cannot have the same source registers"
-                )
-            cmp = self.registers[src1] < self.registers[src0]
-            if self.is_flag_combining:
-                self.flag |= cmp
-            else:
-                self.flag = cmp
-            next_is_flag_combining = True
-        elif instr.name == "Halve":
-            dst = self.getRegIndex(instr, 0)
-            self.flag = self.registers[dst] % 2 == 1
-            self.registers[dst] //= 2
-        elif instr.name == "JumpFwd":
-            src = self.getRegIndex(instr, 0)
-            offset = self.registers[src]
-            self.pc += offset
-            assert 0 <= self.pc < len(self.program.instructions), "Jump out of bounds"
-        elif instr.name == "JumpBwd":
-            src = self.getRegIndex(instr, 0)
-            offset = self.registers[src]
-            self.pc -= offset
-            assert 0 <= self.pc < len(self.program.instructions), "Jump out of bounds"
-        elif instr.name == "JumpFwdNF":
-            if not self.flag:
-                src = self.getRegIndex(instr, 0)
-                offset = self.registers[src]
-                self.pc += offset
-                assert (
-                    0 <= self.pc < len(self.program.instructions)
-                ), "Jump out of bounds"
-        elif instr.name == "JumpBwdNF":
-            if not self.flag:
-                src = self.getRegIndex(instr, 0)
-                offset = self.registers[src]
-                self.pc -= offset
-                assert (
-                    0 <= self.pc < len(self.program.instructions)
-                ), "Jump out of bounds"
-        elif instr.name == "JumpFwdF":
-            if self.flag:
-                src = self.getRegIndex(instr, 0)
-                offset = self.registers[src]
-                self.pc += offset
-                assert (
-                    0 <= self.pc < len(self.program.instructions)
-                ), "Jump out of bounds"
-        elif instr.name == "JumpBwdF":
-            if self.flag:
-                src = self.getRegIndex(instr, 0)
-                offset = self.registers[src]
-                self.pc -= offset
-                assert (
-                    0 <= self.pc < len(self.program.instructions)
-                ), "Jump out of bounds"
-        elif instr.name == "Store":
-            # Spec: "8 Y Z | mem[rZ] = rY" — first operand is the value,
-            # second is the address.
-            src0 = self.getRegIndex(instr, 0)
-            src1 = self.getRegIndex(instr, 1)
-            self.memory[self.registers[src1]] = self.registers[src0]
-        elif instr.name == "Load":
-            dst = self.getRegIndex(instr, 0)
-            src = self.getRegIndex(instr, 1)
-            addr = self.registers[src]
-            if addr not in self.memory:
+                flag = True
+        elif name == "Mult":
+            regs[a[0]] *= regs[a[1]]
+        elif name == "Move":
+            regs[a[0]] = regs[a[1]]
+        elif name == "Load":
+            addr = regs[a[1]]
+            v = mem.get(addr)
+            if v is None:
                 if not self.mem_default_zero:
                     raise ValueError(f"Memory read from uninitialized address: {addr}")
-            self.registers[dst] = self.memory.get(addr, 0)
-        elif instr.name == "Output":
-            src = self.getRegIndex(instr, 0)
-            self.output.append(self.registers[src])
-            # print(f"Output: {self.registers[src]}")
-        elif instr.name == "AInput" or instr.name == "BInput":
-            dst = self.getRegIndex(instr, 0)
-            who = "Alice" if instr.name == "AInput" else "Bob"
+                v = 0
+            regs[a[0]] = v
+        elif name == "Store":
+            mem[regs[a[1]]] = regs[a[0]]
+        elif name == "Add1":
+            regs[a[0]] += 1
+        elif name == "Sub1Cond":
+            d = a[0]
+            if regs[d] > 0:
+                regs[d] -= 1
+                flag = False
+            else:
+                flag = True
+        elif name == "Zero":
+            regs[a[0]] = 0
+        elif name == "Divide":
+            d = a[0]
+            quot, rem = divmod(regs[d], regs[0])
+            regs[d] = rem
+            regs[6] = quot
+            flag = quot != 0
+        elif name == "SetF":
+            regs[a[0]] = 1 if flag else 0
+        elif name == "SetNF":
+            regs[a[0]] = 0 if flag else 1
+        elif name == "FIsZero":
+            cmp = regs[a[0]] == 0
+            flag = (flag or cmp) if is_flag_combining else cmp
+            next_is_flag_combining = True
+        elif name == "FLess":
+            # Spec: "11 Y Z | flag = (rZ < rY)". Op order is (Y, Z), so
+            # flag = (regs[second] < regs[first]).
+            cmp = regs[a[1]] < regs[a[0]]
+            flag = (flag or cmp) if is_flag_combining else cmp
+            next_is_flag_combining = True
+        elif name == "Halve":
+            d = a[0]
+            flag = (regs[d] & 1) == 1
+            regs[d] >>= 1
+        elif name == "JumpFwd":
+            pc += regs[a[0]]
+            if not (0 <= pc < n_instrs):
+                raise AssertionError(f"Jump out of bounds: dst_pc={pc}")
+        elif name == "JumpBwd":
+            pc -= regs[a[0]]
+            if not (0 <= pc < n_instrs):
+                raise AssertionError(f"Jump out of bounds: dst_pc={pc}")
+        elif name == "JumpFwdNF":
+            if not flag:
+                pc += regs[a[0]]
+                if not (0 <= pc < n_instrs):
+                    raise AssertionError(f"Jump out of bounds: dst_pc={pc}")
+        elif name == "JumpBwdNF":
+            if not flag:
+                pc -= regs[a[0]]
+                if not (0 <= pc < n_instrs):
+                    raise AssertionError(f"Jump out of bounds: dst_pc={pc}")
+        elif name == "JumpFwdF":
+            if flag:
+                pc += regs[a[0]]
+                if not (0 <= pc < n_instrs):
+                    raise AssertionError(f"Jump out of bounds: dst_pc={pc}")
+        elif name == "JumpBwdF":
+            if flag:
+                pc -= regs[a[0]]
+                if not (0 <= pc < n_instrs):
+                    raise AssertionError(f"Jump out of bounds: dst_pc={pc}")
+        elif name == "Output":
+            self.output.append(regs[a[0]])
+        elif name == "CallFwd":
+            self.return_stack.append(pc + 1)
+            pc += regs[a[0]]
+        elif name == "CallBwd" or name == "CallBwdR":
+            self.return_stack.append(pc + 1)
+            pc -= regs[a[0]]
+        elif name == "Return":
+            if not self.return_stack:
+                raise StopIteration("Program returned")
+            pc = self.return_stack.pop() - 1
+        elif name == "AInput" or name == "BInput":
+            who = "Alice" if name == "AInput" else "Bob"
             try:
                 line = input(f"{who} input> ").strip()
                 value = int(line)
             except (EOFError, ValueError):
                 value = 0
-            self.registers[dst] = value & 0xFFFFFFFF
-        elif instr.name == "CallFwd":
-            src = self.getRegIndex(instr, 0)
-            offset = self.registers[src]
-            # Push the return address (next instruction) and jump forward.
-            # step() appends +1 to pc after us, so we leave pc one short of
-            # the target — mirroring how Jumps are handled.
-            self.return_stack.append(self.pc + 1)
-            self.pc += offset
-        elif instr.name == "CallBwd" or instr.name == "CallBwdR":
-            src = self.getRegIndex(instr, 0)
-            offset = self.registers[src]
-            self.return_stack.append(self.pc + 1)
-            # The target may be instruction 0, so pc can legitimately hit -1
-            # here — step() will roll it forward by 1 before the next fetch.
-            self.pc -= offset
-        elif instr.name == "Return":
-            # Empty stack => returning from the outermost function (_start).
-            # The program is done. Non-empty stack => pop and jump back.
-            if not self.return_stack:
-                raise StopIteration("Program returned")
-            # step() adds +1 to pc at the end; subtract 1 so we land exactly
-            # on the saved return address.
-            self.pc = self.return_stack.pop() - 1
-        # All _MACRO / _PSEUDO handlers (ADD_MACRO, NUMBUILD_MACRO, LT_MACRO,
-        # DIV_MACRO, RET_PSEUDO, ...) have been removed: the LLVM backend now
-        # expands every such pseudo into native instructions before emission.
-        # The single exception is NumBuildAddr, which is resolved into 4
-        # native NumBuild pairs by assembler.py's fixup pass before the
-        # simulator ever sees it — see expand_global_addr_pseudos().
+            regs[a[0]] = value & 0xFFFFFFFF
         else:
-            raise ValueError(f"Unhandled instruction: {instr.name}")
-        self.pc += 1
+            if name not in INSTRUCTIONS and name not in MACRO_INSTRUCTIONS:
+                raise ValueError(f"Unknown instruction: {name}")
+            raise ValueError(f"Unhandled instruction: {name}")
+
+        self.pc = pc + 1
+        self.flag = flag
         self.is_num_building = next_is_num_building
         self.is_flag_combining = next_is_flag_combining

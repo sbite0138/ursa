@@ -65,21 +65,46 @@ def main():
 
     steps = 0
     t0 = time.perf_counter()
+    last_tick = t0
+    # Periodic progress line every ~3s of wall time so long-running
+    # programs (full-system boots) show they're alive. The check adds
+    # a few ns per step — negligible compared to step cost.
+    TICK_EVERY_STEPS = 100000
+
+    def flush_output_stream():
+        # Stream whatever's been emitted so far to stdout (without a
+        # trailing newline, since Output is already a byte stream).
+        buf = simulator.output
+        if buf:
+            sys.stdout.write("".join(chr(c) for c in buf))
+            sys.stdout.flush()
+            buf.clear()
+
     try:
         while True:
             simulator.step()
             steps += 1
+            if steps % TICK_EVERY_STEPS == 0:
+                now = time.perf_counter()
+                if now - last_tick >= 3.0:
+                    flush_output_stream()
+                    print(
+                        f"[ursa-tick] {steps:,} steps, "
+                        f"{steps / (now - t0):,.0f} steps/s, "
+                        f"mem={len(simulator.memory):,}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    last_tick = now
     except StopIteration:
         elapsed = time.perf_counter() - t0
-        print("Program finished.")
-        print("Output:")
-        for char in simulator.output:
-            print(chr(char), end="")
-        print()
+        flush_output_stream()
+        print("\nProgram finished.")
         print(f"[ursa] {steps:,} steps in {elapsed:.3f}s ({steps/elapsed:,.0f} steps/s)", file=sys.stderr)
     except Exception as e:
         elapsed = time.perf_counter() - t0
-        print(f"Error during simulation: {e}")
+        flush_output_stream()
+        print(f"\nError during simulation: {e}")
         print(f"[ursa] {steps:,} steps in {elapsed:.3f}s", file=sys.stderr)
 
 
