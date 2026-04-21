@@ -10,9 +10,11 @@
 
 mod assembler;
 mod simulator;
+mod snapshot;
 
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -22,6 +24,20 @@ struct Args {
     zero_mem: bool,
     trace_pc: bool,
     max_steps: Option<u64>,
+    /// On a graceful exit (halt / max-steps / --stop-marker), write the
+    /// simulator state to this path so a later run can --load-snapshot
+    /// and resume.
+    save_snapshot: Option<String>,
+    /// Load simulator state from this path at startup instead of
+    /// initializing fresh. The .s file on the CLI must match the one
+    /// that was active when the snapshot was taken.
+    load_snapshot: Option<String>,
+    /// If set, the main loop polls for this file path every ~1 M steps
+    /// and exits cleanly when it appears. The stop-marker file is
+    /// removed on detection. Pair with --save-snapshot to capture state
+    /// from an external observer ("I see the login prompt; `touch
+    /// /tmp/stop` to snap it").
+    stop_marker: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -32,6 +48,9 @@ fn parse_args() -> Result<Args, String> {
     let mut zero_mem = false;
     let mut trace_pc = false;
     let mut max_steps = None;
+    let mut save_snapshot = None;
+    let mut load_snapshot = None;
+    let mut stop_marker = None;
     while let Some(arg) = a.next() {
         if arg == "--rom" {
             let spec = a.next().ok_or("--rom needs PATH@ADDR")?;
@@ -51,6 +70,12 @@ fn parse_args() -> Result<Args, String> {
         } else if arg == "--max-steps" {
             let v = a.next().ok_or("--max-steps needs N")?;
             max_steps = Some(v.parse::<u64>().map_err(|e| e.to_string())?);
+        } else if arg == "--save-snapshot" {
+            save_snapshot = Some(a.next().ok_or("--save-snapshot needs PATH")?);
+        } else if arg == "--load-snapshot" {
+            load_snapshot = Some(a.next().ok_or("--load-snapshot needs PATH")?);
+        } else if arg == "--stop-marker" {
+            stop_marker = Some(a.next().ok_or("--stop-marker needs PATH")?);
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {}", arg));
         } else if source.is_none() {
@@ -65,6 +90,9 @@ fn parse_args() -> Result<Args, String> {
         zero_mem,
         trace_pc,
         max_steps,
+        save_snapshot,
+        load_snapshot,
+        stop_marker,
     })
 }
 
@@ -125,6 +153,30 @@ fn main() -> ExitCode {
         );
     }
 
+    // If the user asked for a resume, overwrite the fresh-init state with
+    // whatever the snapshot recorded. The snapshot load clears `memory`
+    // and then repopulates it, so any --rom data we just inserted gets
+    // discarded — which is exactly what we want, because the guest has
+    // long since mutated those bytes.
+    if let Some(path) = &args.load_snapshot {
+        let t_load = Instant::now();
+        if let Err(e) = snapshot::load(&mut sim, path) {
+            eprintln!("ursa-rs: failed to load snapshot {:?}: {}", path, e);
+            return ExitCode::from(2);
+        }
+        eprintln!(
+            "[ursa-rs] loaded snapshot {:?} ({} memory entries) in {} ms",
+            path,
+            sim.memory.len(),
+            t_load.elapsed().as_millis()
+        );
+    }
+
+    // Shared helper: flush stdout, print final stats, optionally save
+    // snapshot, optionally dump PC hist, and return the given exit code.
+    // Declared as a closure-like sequence inline inside the match arms
+    // below (Rust's borrow of `sim` makes hoisting to a closure painful).
+
     let t0 = Instant::now();
     let mut steps: u64 = 0;
     let mut last_tick = t0;
@@ -143,6 +195,7 @@ fn main() -> ExitCode {
                 if args.trace_pc {
                     dump_pc_hist(&sim);
                 }
+                maybe_save_snapshot(&sim, &args.save_snapshot, "max-steps");
                 return ExitCode::SUCCESS;
             }
         }
@@ -161,6 +214,7 @@ fn main() -> ExitCode {
                 if args.trace_pc {
                     dump_pc_hist(&sim);
                 }
+                maybe_save_snapshot(&sim, &args.save_snapshot, "halt");
                 return ExitCode::SUCCESS;
             }
             simulator::StepResult::Err(e) => {
@@ -173,7 +227,8 @@ fn main() -> ExitCode {
         }
         steps += 1;
         // Periodic progress tick — cheap modulo check, printed at most
-        // once every 3 wall-clock seconds.
+        // once every 3 wall-clock seconds. Also the spot where we poll
+        // for the stop-marker so signal-free "save and exit" works.
         if steps & 0xFFFFF == 0 {
             let now = Instant::now();
             if now.duration_since(last_tick).as_secs_f64() >= 3.0 {
@@ -186,7 +241,44 @@ fn main() -> ExitCode {
                 );
                 last_tick = now;
             }
+            if let Some(marker) = &args.stop_marker {
+                if Path::new(marker).exists() {
+                    flush_output(&mut sim);
+                    eprintln!(
+                        "[ursa-rs] stop-marker {:?} detected at {} steps, \
+                         saving and exiting",
+                        marker, steps
+                    );
+                    maybe_save_snapshot(&sim, &args.save_snapshot, "stop-marker");
+                    // Best-effort cleanup: leave the marker in place on
+                    // failure so the next retry still sees it.
+                    let _ = fs::remove_file(marker);
+                    return ExitCode::SUCCESS;
+                }
+            }
         }
+    }
+}
+
+fn maybe_save_snapshot(
+    sim: &simulator::Simulator,
+    path_opt: &Option<String>,
+    reason: &str,
+) {
+    let Some(path) = path_opt else { return };
+    let t = Instant::now();
+    match snapshot::save(sim, path) {
+        Ok(()) => eprintln!(
+            "[ursa-rs] saved snapshot to {:?} ({} memory entries) in {} ms (reason: {})",
+            path,
+            sim.memory.len(),
+            t.elapsed().as_millis(),
+            reason
+        ),
+        Err(e) => eprintln!(
+            "[ursa-rs] snapshot save to {:?} FAILED: {} (reason: {})",
+            path, e, reason
+        ),
     }
 }
 
