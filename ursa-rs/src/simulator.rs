@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use crate::assembler::{Op, Program};
+use crate::input::InputQueue;
 
 pub enum StepResult {
     Ok,
@@ -27,6 +28,12 @@ pub struct Simulator {
     /// no cost.
     pub pc_hist: Vec<u64>,
     pub pc_hist_enabled: bool,
+    /// When `Some`, `AInput` reads the next byte from this stdin-fed
+    /// queue (returning 0xFFFF_FFFF when the queue is empty). When
+    /// `None`, `AInput` and `BInput` both deliver 0 — matches the
+    /// original "input not supported" behaviour and keeps existing
+    /// non-interactive tests byte-for-byte identical.
+    pub input_queue: Option<InputQueue>,
 }
 
 impl Simulator {
@@ -55,6 +62,7 @@ impl Simulator {
             mem_default_zero,
             pc_hist: Vec::new(),
             pc_hist_enabled: false,
+            input_queue: None,
         }
     }
 
@@ -255,9 +263,23 @@ impl Simulator {
                     None => return StepResult::Halt,
                 }
             }
-            Op::AInput | Op::BInput => {
-                // Interactive input is not supported in ursa-rs right now
-                // (we have no CLI prompt path yet); deliver 0.
+            Op::AInput => {
+                // Non-blocking byte pull from the shared stdin queue,
+                // with 0xFFFF_FFFF (= -1 when the guest interprets the
+                // result as i32) as the "no data available" sentinel.
+                regs[a[0] as usize] = match self.input_queue.as_ref() {
+                    Some(q) => match q.pop_byte() {
+                        Some(b) => b as u64,
+                        None => 0xFFFF_FFFFu64,
+                    },
+                    None => 0,
+                };
+            }
+            Op::BInput => {
+                // BInput is currently unused by the Linux harness. Keep
+                // returning 0 so we don't accidentally consume queue
+                // bytes meant for AInput, and so existing non-interactive
+                // tests see the same value they always have.
                 regs[a[0] as usize] = 0;
             }
         }

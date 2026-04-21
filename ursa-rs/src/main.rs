@@ -9,6 +9,7 @@
 //!     ursa-rs <source.s> [--rom PATH@ADDR ...] [--zero-mem]
 
 mod assembler;
+mod input;
 mod simulator;
 mod snapshot;
 
@@ -38,6 +39,13 @@ struct Args {
     /// from an external observer ("I see the login prompt; `touch
     /// /tmp/stop` to snap it").
     stop_marker: Option<String>,
+    /// Hook the `AInput` primitive up to stdin so a guest running
+    /// inside the MtG program (e.g. the mini-rv32ima harness that
+    /// powers linux_boot) can receive interactive keystrokes. `AInput`
+    /// returns 0xFFFF_FFFF when stdin has nothing pending, otherwise
+    /// the next byte. No termios manipulation yet — stdin is still
+    /// line-buffered by the host terminal.
+    raw_input: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -51,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
     let mut save_snapshot = None;
     let mut load_snapshot = None;
     let mut stop_marker = None;
+    let mut raw_input = false;
     while let Some(arg) = a.next() {
         if arg == "--rom" {
             let spec = a.next().ok_or("--rom needs PATH@ADDR")?;
@@ -76,6 +85,8 @@ fn parse_args() -> Result<Args, String> {
             load_snapshot = Some(a.next().ok_or("--load-snapshot needs PATH")?);
         } else if arg == "--stop-marker" {
             stop_marker = Some(a.next().ok_or("--stop-marker needs PATH")?);
+        } else if arg == "--raw-input" {
+            raw_input = true;
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {}", arg));
         } else if source.is_none() {
@@ -93,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
         save_snapshot,
         load_snapshot,
         stop_marker,
+        raw_input,
     })
 }
 
@@ -132,6 +144,10 @@ fn main() -> ExitCode {
     let mut sim = simulator::Simulator::new(program, args.zero_mem);
     if args.trace_pc {
         sim.enable_pc_hist();
+    }
+    if args.raw_input {
+        sim.input_queue = Some(input::InputQueue::new());
+        eprintln!("[ursa-rs] --raw-input: AInput will pull bytes from stdin");
     }
 
     for (path, addr) in &args.roms {
