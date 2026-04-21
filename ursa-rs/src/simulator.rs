@@ -267,20 +267,28 @@ impl Simulator {
                 // Non-blocking byte pull from the shared stdin queue,
                 // with 0xFFFF_FFFF (= -1 when the guest interprets the
                 // result as i32) as the "no data available" sentinel.
+                //
+                // When --raw-input is not in effect we have no input
+                // channel at all — the guest still polls AInput to
+                // discover that fact, and "no data" (0xFFFF_FFFF) is
+                // the right answer, not "zero byte received" (0). The
+                // latter would make a harness that trusts AInput on
+                // every step inject a flood of NULs into its emulated
+                // UART RX path.
                 regs[a[0] as usize] = match self.input_queue.as_ref() {
                     Some(q) => match q.pop_byte() {
                         Some(b) => b as u64,
                         None => 0xFFFF_FFFFu64,
                     },
-                    None => 0,
+                    None => 0xFFFF_FFFFu64,
                 };
             }
             Op::BInput => {
-                // BInput is currently unused by the Linux harness. Keep
-                // returning 0 so we don't accidentally consume queue
-                // bytes meant for AInput, and so existing non-interactive
-                // tests see the same value they always have.
-                regs[a[0] as usize] = 0;
+                // BInput is not wired to any input channel. Same "no
+                // data" sentinel as AInput on the no-queue path so a
+                // guest polling it reads a value that's unambiguously
+                // "no byte arrived".
+                regs[a[0] as usize] = 0xFFFF_FFFFu64;
             }
         }
 
