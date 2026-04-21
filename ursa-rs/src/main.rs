@@ -212,6 +212,7 @@ fn main() -> ExitCode {
                     dump_pc_hist(&sim);
                 }
                 maybe_save_snapshot(&sim, &args.save_snapshot, "max-steps");
+                report_input_stats(&sim);
                 return ExitCode::SUCCESS;
             }
         }
@@ -231,6 +232,7 @@ fn main() -> ExitCode {
                     dump_pc_hist(&sim);
                 }
                 maybe_save_snapshot(&sim, &args.save_snapshot, "halt");
+                report_input_stats(&sim);
                 return ExitCode::SUCCESS;
             }
             simulator::StepResult::Err(e) => {
@@ -266,6 +268,7 @@ fn main() -> ExitCode {
                         marker, steps
                     );
                     maybe_save_snapshot(&sim, &args.save_snapshot, "stop-marker");
+                    report_input_stats(&sim);
                     // Best-effort cleanup: leave the marker in place on
                     // failure so the next retry still sees it.
                     let _ = fs::remove_file(marker);
@@ -273,6 +276,15 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+fn report_input_stats(sim: &simulator::Simulator) {
+    if sim.input_queue.is_some() {
+        eprintln!(
+            "[ursa-rs] AInput delivered {} byte(s) from stdin during this run",
+            sim.ainput_bytes_delivered
+        );
     }
 }
 

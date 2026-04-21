@@ -34,6 +34,11 @@ pub struct Simulator {
     /// original "input not supported" behaviour and keeps existing
     /// non-interactive tests byte-for-byte identical.
     pub input_queue: Option<InputQueue>,
+    /// Debug stats: number of `AInput` calls that returned a real byte
+    /// (as opposed to the 0xFFFF_FFFF "no data" sentinel). Useful to
+    /// verify end-to-end that stdin bytes are actually reaching the
+    /// guest before worrying about whether the guest acted on them.
+    pub ainput_bytes_delivered: u64,
 }
 
 impl Simulator {
@@ -63,6 +68,7 @@ impl Simulator {
             pc_hist: Vec::new(),
             pc_hist_enabled: false,
             input_queue: None,
+            ainput_bytes_delivered: 0,
         }
     }
 
@@ -277,7 +283,10 @@ impl Simulator {
                 // UART RX path.
                 regs[a[0] as usize] = match self.input_queue.as_ref() {
                     Some(q) => match q.pop_byte() {
-                        Some(b) => b as u64,
+                        Some(b) => {
+                            self.ainput_bytes_delivered += 1;
+                            b as u64
+                        }
                         None => 0xFFFF_FFFFu64,
                     },
                     None => 0xFFFF_FFFFu64,
