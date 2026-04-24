@@ -22,6 +22,58 @@ import sys
 GLOBALS_BASE = 1024
 
 
+def _asciz_byte_count(operand, nul):
+    """Count the bytes a `.asciz "…"` / `.ascii "…"` produces.
+
+    Mirrors the escape-sequence decoder in ursa-rs's assembler so label
+    addresses stay in sync with the ursa side. Returns the payload
+    length plus 1 (for the trailing NUL) when `nul` is True.
+    """
+    operand = operand.strip()
+    start = operand.find('"')
+    if start < 0:
+        return 0
+    end = operand.rfind('"')
+    if end <= start:
+        return 0
+    body = operand[start + 1:end]
+    out = 0
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c != '\\':
+            out += len(c.encode('utf-8'))
+            i += 1
+            continue
+        i += 1
+        if i >= len(body):
+            break
+        esc = body[i]
+        i += 1
+        if esc in ('n', 't', 'r', '0', '\\', '"', "'", 'a', 'b', 'f', 'v'):
+            out += 1
+        elif esc == 'x':
+            # up to 2 hex digits
+            consumed = 0
+            while consumed < 2 and i < len(body) and body[i] in "0123456789abcdefABCDEF":
+                i += 1
+                consumed += 1
+            out += 1
+        elif esc in "01234567":
+            # up to 3 octal digits (first already consumed as `esc`)
+            consumed = 1
+            while consumed < 3 and i < len(body) and body[i] in "01234567":
+                i += 1
+                consumed += 1
+            out += 1
+        else:
+            # Unknown escape: copy both characters, matching GAS.
+            out += 1 + len(esc.encode('utf-8'))
+    if nul:
+        out += 1
+    return out
+
+
 def parse_sections(lines, file_idx):
     """Split an assembly file into text lines, data lines, and .comm directives.
 
@@ -34,8 +86,18 @@ def parse_sections(lines, file_idx):
     prefix = f".F{file_idx}_"
 
     def rename(line):
-        """Rename .L-prefixed local labels/references to file-specific names."""
-        return re.sub(r"\.L(\w+)", prefix + "L\\1", line)
+        """Rename file-local labels/references to file-specific names.
+
+        Covers the two local-label conventions Clang emits:
+        - `.L<name>` — generic local labels (basic-block targets, func-end
+          markers, compiler-generated helpers)
+        - `.str[.N]` — string-literal symbols in .rodata. Each TU minted
+          its own `.str` et al., so if two files both use string literals
+          they'd collide in ursa's global-label table.
+        """
+        line = re.sub(r"\.L(\w+)", prefix + "L\\1", line)
+        line = re.sub(r"\.str(\.\d+)?\b", prefix + "str\\1", line)
+        return line
 
     for line in lines:
         stripped = line.rstrip()
@@ -142,15 +204,33 @@ def compute_data_addresses(all_data, merged_comms):
             if not parts:
                 continue
             directive = parts[0]
-            if directive == ".long":
+            if directive == ".long" or directive == ".4byte":
                 cursor += 4
             elif directive == ".byte":
                 cursor += 1
+            elif directive in (".short", ".2byte", ".hword"):
+                # Keep in sync with ursa-rs's assembler: 2-byte LE integer.
+                # Clang emits .short for CRC lookup tables at -O1, so
+                # accounting for the size here is essential to keep later
+                # label addresses correct.
+                cursor += 2
+            elif directive in (".zero", ".space"):
+                n = int(parts[1].split(",")[0])
+                cursor += n
             elif directive == ".p2align":
                 pow2 = int(parts[1].split(",")[0])
                 align = 1 << pow2
                 if cursor % align != 0:
                     cursor += align - (cursor % align)
+            elif directive in (".asciz", ".ascii"):
+                # Measure the string literal so subsequent labels get the
+                # right address. Mirror the escape-sequence handling in
+                # ursa-rs's assembler. Clang emits .asciz for every
+                # string literal, so getting this wrong makes every
+                # format-string pointer off by the combined length of all
+                # preceding strings.
+                operand = parts[1] if len(parts) > 1 else ""
+                cursor += _asciz_byte_count(operand, nul=(directive == ".asciz"))
             # Other directives (metadata) don't move the cursor.
 
     for name, (size, align) in merged_comms.items():
