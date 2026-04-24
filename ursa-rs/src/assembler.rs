@@ -290,6 +290,79 @@ fn split_sym_offset(tok: &str) -> (String, i64) {
     (tok.to_string(), 0)
 }
 
+/// Parse the operand of `.asciz "..."` / `.ascii "..."` into raw bytes,
+/// expanding C-style escape sequences. Clang emits escape sequences for
+/// every non-printable byte (\n, \t, \0), plus octal and hex forms for
+/// anything above 0x7E, so we cover the full set.
+fn parse_string_literal(operand: &str) -> Vec<u8> {
+    let operand = operand.trim();
+    let Some(start) = operand.find('"') else {
+        return Vec::new();
+    };
+    let body_start = start + 1;
+    let Some(end) = operand[body_start..].rfind('"') else {
+        return Vec::new();
+    };
+    let body = &operand[body_start..body_start + end];
+    let mut out = Vec::with_capacity(body.len());
+    let mut iter = body.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c != '\\' {
+            // Single byte of UTF-8 — Clang only emits ASCII literally,
+            // but if somebody hand-rolls a .asciz with multi-byte chars
+            // we encode the whole UTF-8 sequence anyway.
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            out.extend_from_slice(s.as_bytes());
+            continue;
+        }
+        let Some(esc) = iter.next() else { break };
+        match esc {
+            'n' => out.push(b'\n'),
+            't' => out.push(b'\t'),
+            'r' => out.push(b'\r'),
+            '0' => out.push(0),
+            '\\' => out.push(b'\\'),
+            '"' => out.push(b'"'),
+            '\'' => out.push(b'\''),
+            'a' => out.push(0x07),
+            'b' => out.push(0x08),
+            'f' => out.push(0x0c),
+            'v' => out.push(0x0b),
+            'x' => {
+                // \xHH — up to 2 hex digits.
+                let mut v = 0u32;
+                for _ in 0..2 {
+                    let Some(&d) = iter.peek() else { break };
+                    if !d.is_ascii_hexdigit() { break }
+                    iter.next();
+                    v = v * 16 + d.to_digit(16).unwrap();
+                }
+                out.push(v as u8);
+            }
+            d if d.is_digit(8) => {
+                // \NNN — up to 3 octal digits (first digit already consumed).
+                let mut v = d.to_digit(8).unwrap();
+                for _ in 0..2 {
+                    let Some(&d2) = iter.peek() else { break };
+                    if !d2.is_digit(8) { break }
+                    iter.next();
+                    v = v * 8 + d2.to_digit(8).unwrap();
+                }
+                out.push(v as u8);
+            }
+            other => {
+                // Unknown escape — copy as-is, which is what GAS does.
+                out.push(b'\\');
+                let mut buf = [0u8; 4];
+                let s = other.encode_utf8(&mut buf);
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+    out
+}
+
 fn parse_int(tok: &str) -> Option<i64> {
     let (sign, rest) = if let Some(r) = tok.strip_prefix('-') {
         (-1, r)
@@ -389,12 +462,65 @@ pub fn parse(source: &str) -> Result<Program, String> {
                     program.init_memory_byte(data_cursor, v as u64);
                     data_cursor += 1;
                 }
+                // 2-byte integer (little-endian). Clang's -O1 loop→table
+                // optimiser emits precomputed CRC tables as `.short`, so
+                // dropping this silently makes every table lookup return
+                // zero — observed as seedcrc=0 in coremark. Also handle
+                // the GAS alias `.2byte` for completeness.
+                ".short" | ".2byte" | ".hword" => {
+                    let tok = rest.split_whitespace().next().unwrap_or("");
+                    let v = parse_int(tok).unwrap_or(0) as u64;
+                    program.init_memory_byte(data_cursor,      v & 0xFF);
+                    program.init_memory_byte(data_cursor + 1, (v >> 8) & 0xFF);
+                    data_cursor += 2;
+                }
+                // Alias for `.long`, sometimes emitted by Clang (GAS's
+                // .4byte). Already covered by .long above but we list
+                // the alias explicitly.
+                ".4byte" => {
+                    let tok = rest.split_whitespace().next().unwrap_or("");
+                    if let Some(v) = parse_int(tok) {
+                        program.init_memory_long(data_cursor, v as u64);
+                    } else {
+                        let (sym, off) = split_sym_offset(tok);
+                        program.data_fixups.push((data_cursor, sym, off));
+                    }
+                    data_cursor += 4;
+                }
+                // `.zero N` / `.space N`: reserve N zero-valued bytes.
+                // Clang emits these for BSS-style padding inside .rodata.
+                ".zero" | ".space" => {
+                    let tok = rest.split_whitespace().next().unwrap_or("");
+                    if let Some(n) = parse_int(tok) {
+                        for i in 0..(n as u64) {
+                            program.init_memory_byte(data_cursor + i, 0);
+                        }
+                        data_cursor += n as u64;
+                    }
+                }
                 ".p2align" => {
                     let tok = rest.split(',').next().unwrap_or("").trim();
                     let pow2: u32 = tok.parse().unwrap_or(0);
                     let align = 1u64 << pow2;
                     if align > 0 && data_cursor % align != 0 {
                         data_cursor += align - (data_cursor % align);
+                    }
+                }
+                // String literals: `.asciz "..."` stores bytes then a
+                // trailing NUL; `.ascii "..."` stores bytes only. Clang
+                // uses .asciz for every string literal in .rodata, so
+                // dropping these silently makes every printf format
+                // string read as an empty string (observed via coremark
+                // ee_printf getting fmt pointers into all-zero memory).
+                ".asciz" | ".ascii" => {
+                    let bytes = parse_string_literal(rest);
+                    for b in &bytes {
+                        program.init_memory_byte(data_cursor, *b as u64);
+                        data_cursor += 1;
+                    }
+                    if directive == ".asciz" {
+                        program.init_memory_byte(data_cursor, 0);
+                        data_cursor += 1;
                     }
                 }
                 _ => {}
