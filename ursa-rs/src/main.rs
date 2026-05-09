@@ -9,6 +9,7 @@
 //!     ursa-rs <source.s> [--rom PATH@ADDR ...] [--zero-mem]
 
 mod assembler;
+mod dump;
 mod input;
 mod simulator;
 mod snapshot;
@@ -46,6 +47,13 @@ struct Args {
     /// the next byte. No termios manipulation yet — stdin is still
     /// line-buffered by the host terminal.
     raw_input: bool,
+    /// Instruction-counts at which to write a card-level state dump
+    /// for handoff to mtgemu-claude. Sorted+deduped after parse.
+    /// `0` means "before any instruction executes" (initial state).
+    dump_at: Vec<u64>,
+    /// Path template for `--dump-at` outputs. `{n}` is substituted with
+    /// the instruction count. Required when `--dump-at` is given.
+    dump_out: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -60,6 +68,8 @@ fn parse_args() -> Result<Args, String> {
     let mut load_snapshot = None;
     let mut stop_marker = None;
     let mut raw_input = false;
+    let mut dump_at: Vec<u64> = Vec::new();
+    let mut dump_out: Option<String> = None;
     while let Some(arg) = a.next() {
         if arg == "--rom" {
             let spec = a.next().ok_or("--rom needs PATH@ADDR")?;
@@ -87,6 +97,11 @@ fn parse_args() -> Result<Args, String> {
             stop_marker = Some(a.next().ok_or("--stop-marker needs PATH")?);
         } else if arg == "--raw-input" {
             raw_input = true;
+        } else if arg == "--dump-at" {
+            let v = a.next().ok_or("--dump-at needs N")?;
+            dump_at.push(v.parse::<u64>().map_err(|e| e.to_string())?);
+        } else if arg == "--dump-out" {
+            dump_out = Some(a.next().ok_or("--dump-out needs PATH")?);
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {}", arg));
         } else if source.is_none() {
@@ -95,6 +110,19 @@ fn parse_args() -> Result<Args, String> {
             return Err(format!("unexpected positional arg: {}", arg));
         }
     }
+    if !dump_at.is_empty() {
+        if dump_out.is_none() {
+            return Err("--dump-at requires --dump-out PATH".into());
+        }
+        let path = dump_out.as_ref().unwrap();
+        if dump_at.len() > 1 && !path.contains("{n}") {
+            return Err(
+                "--dump-out template must contain {n} when multiple --dump-at are given".into(),
+            );
+        }
+    }
+    dump_at.sort_unstable();
+    dump_at.dedup();
     Ok(Args {
         source: source.ok_or("missing source file")?,
         roms,
@@ -105,6 +133,8 @@ fn parse_args() -> Result<Args, String> {
         load_snapshot,
         stop_marker,
         raw_input,
+        dump_at,
+        dump_out,
     })
 }
 
@@ -196,6 +226,18 @@ fn main() -> ExitCode {
     let t0 = Instant::now();
     let mut steps: u64 = 0;
     let mut last_tick = t0;
+    // Sorted + deduped at parse time. Cursor advances as we hit each
+    // requested instruction count, so the per-step check is O(1).
+    let dump_at = args.dump_at.clone();
+    let dump_template = args.dump_out.clone();
+    let mut dump_cursor: usize = 0;
+    // --dump-at 0 means "before any instruction has executed". Drain the
+    // cursor of any zero entries up front so the in-loop check only ever
+    // looks at strictly positive counts.
+    while dump_cursor < dump_at.len() && dump_at[dump_cursor] == 0 {
+        do_dump(&sim, 0, dump_template.as_ref().unwrap());
+        dump_cursor += 1;
+    }
     loop {
         if let Some(m) = args.max_steps {
             if steps >= m {
@@ -244,6 +286,14 @@ fn main() -> ExitCode {
             }
         }
         steps += 1;
+        // After completing instruction `steps`, check whether the user
+        // asked for a dump at exactly this count. Multiple counts may
+        // coincide (after dedup they don't, but the loop handles it
+        // anyway).
+        while dump_cursor < dump_at.len() && dump_at[dump_cursor] == steps {
+            do_dump(&sim, steps, dump_template.as_ref().unwrap());
+            dump_cursor += 1;
+        }
         // Periodic progress tick — cheap modulo check, printed at most
         // once every 3 wall-clock seconds. Also the spot where we poll
         // for the stop-marker so signal-free "save and exit" works.
@@ -276,6 +326,24 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+fn do_dump(sim: &simulator::Simulator, instr_count: u64, template: &str) {
+    let path = dump::substitute_template(template, instr_count);
+    let t = Instant::now();
+    match dump::write_dump(sim, instr_count, &path) {
+        Ok(entries) => eprintln!(
+            "[ursa-rs] dumped state at instr_count={} to {:?} ({} memory entries) in {} ms",
+            instr_count,
+            path,
+            entries,
+            t.elapsed().as_millis()
+        ),
+        Err(e) => eprintln!(
+            "[ursa-rs] dump at instr_count={} to {:?} FAILED: {}",
+            instr_count, path, e
+        ),
     }
 }
 
