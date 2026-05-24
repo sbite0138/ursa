@@ -183,7 +183,14 @@ impl Simulator {
                 let rem = dv % r0;
                 regs[d] = rem;
                 regs[6] = quot;
-                flag = quot != 0;
+                // Spec (forge-details.md §9.1, X=4 Y=6): flag = (remainder > 0).
+                // Earlier code keyed off `quot != 0`, which agrees with the spec
+                // when r0 divides dv exactly *and* dv >= r0 — but disagrees
+                // whenever dv < r0 (quot=0, rem=dv, so flag should be 1 not 0)
+                // and whenever dv % r0 == 0 with dv >= r0 (quot!=0, rem=0, flag
+                // should be 0 not 1). Real programs that branch on the flag
+                // after Divide will take the wrong path.
+                flag = rem != 0;
             }
             Op::SetF => {
                 regs[a[0] as usize] = if flag { 1 } else { 0 };

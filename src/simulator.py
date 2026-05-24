@@ -141,7 +141,10 @@ class Simulator:
             quot, rem = divmod(regs[d], regs[0])
             regs[d] = rem
             regs[6] = quot
-            flag = quot != 0
+            # Spec (forge-details.md §9.1, X=4 Y=6): flag = (remainder > 0).
+            # Earlier code keyed off `quot != 0`, which disagrees with the spec
+            # whenever dv < r0 (rem=dv) or dv % r0 == 0 with dv >= r0.
+            flag = rem != 0
         elif name == "SetF":
             regs[a[0]] = 1 if flag else 0
         elif name == "SetNF":
